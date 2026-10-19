@@ -1,7 +1,19 @@
 // Input Buffer
 //
-// Holds a PlayerButton press for up to `buffer-frames` physics steps while the
-// player cannot act on it yet, then fires it on the first step the player can.
+// Three modes, chosen by the "mode" setting:
+//
+//   Buffer             Holds a PlayerButton press for up to `buffer-frames`
+//                      physics steps while the player cannot act on it yet,
+//                      then fires it on the first step the player can.
+//   Record reference   Records every PlayerButton event with the physics step
+//                      it is processed on. A completed run is saved as the
+//                      level's reference.
+//   Snap to reference  Player input never reaches the game directly. Each
+//                      reference event fires on its own step. Every player
+//                      input must match a reference event (same button,
+//                      press/release and player) within `snap-window` steps,
+//                      and every reference event must be matched within the
+//                      window, otherwise the player is killed.
 //
 // Bindings: geode-sdk/bindings, bindings/2.2081/GeometryDash.bro (Geode SDK 5.11.2).
 // "Inline" = the function body is in bindings/2.2081/inline/*.cpp.
@@ -17,7 +29,7 @@
 //   swing   m_isSwing
 //   isFlying() (inline) == m_isShip || m_isBird || m_isDart || m_isSwing
 //
-// "Can act" state used for the discrete modes:
+// "Can act" state used by Buffer mode for the discrete modes:
 //   m_isOnGround      inline code clears it in pushDown() and spawnFromPlayer(),
 //                     and hitGroundNoJump() saves/restores it around hitGround().
 //   m_touchingRings   CCArray*; addToTouchedRings() (inline) adds the ring being
@@ -25,6 +37,7 @@
 //                     bindings.
 //   m_isDead          PlayLayer::isGameplayActive() (inline) reads it.
 //
+// Buffer mode:
 // | mode   | input type | buffered when                 | fires when            |
 // |--------|------------|-------------------------------|-----------------------|
 // | cube   | discrete   | !m_isOnGround && no ring      | m_isOnGround or ring  |
@@ -37,26 +50,43 @@
 // | swing  | continuous | never (pass-through)          | -                     |
 //
 // Continuous modes are the isFlying() group. Their input does not require
-// ground contact, so the player can always act on a press. A buffered press
-// would never be stored, and there is no state to wait for. They are passed
-// through unchanged.
+// ground contact, so the player can always act on a press and Buffer mode
+// has no state to wait for. Snap mode covers them, and every other mode,
+// because it times inputs against the reference instead of the player state.
 //
-// Left/Right (platformer movement) are passed through the same way.
+// Left/Right (platformer movement) pass through in Buffer mode and are
+// snapped like any other button in Snap mode.
 //
 // The press logic itself (PlayerObject::pushButton / releaseButton /
 // updateJump) has addresses but no bodies in the bindings, so the
 // discrete/continuous split above comes from the field and helper names,
 // not from the game's own code.
+//
+// Step counting: one step per GJBaseGameLayer::processCommands call. An input
+// that arrives through handleButton between calls is stamped with the next
+// step. Practice checkpoints keep a copy of the step counter
+// (PlayLayer::createCheckpoint / loadFromCheckpoint), so a reference can be
+// recorded and replayed across checkpoint respawns.
+//
+// Reference files: <mod save dir>/references/<level>.txt, one event per line:
+//   <step> <button 1-3> <push 0/1> <player1 0/1>
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+
+#include <algorithm>
+#include <fstream>
+#include <unordered_map>
+#include <vector>
 
 using namespace geode::prelude;
 
 namespace {
     // PlayerButton is Jump = 1, Left = 2, Right = 3 (Geode/Enums.hpp).
     constexpr int kButtonCount = 3;
+
+    enum class Mode { Buffer, Snap, Record };
 
     struct BufferSlot {
         bool pending = false;        // a press is being held back
@@ -65,8 +95,31 @@ namespace {
         int framesLeft = 0;
     };
 
+    struct InputEvent {
+        int step = 0;
+        int button = 0;
+        bool push = false;
+        bool isPlayer1 = true;
+    };
+
+    struct RefEvent {
+        InputEvent input;
+        bool matched = false;
+    };
+
+    Mode currentMode() {
+        auto mode = Mod::get()->getSettingValue<std::string>("mode");
+        if (mode == "Snap to reference") return Mode::Snap;
+        if (mode == "Record reference") return Mode::Record;
+        return Mode::Buffer;
+    }
+
     int bufferFrames() {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("buffer-frames"));
+    }
+
+    int snapWindow() {
+        return static_cast<int>(Mod::get()->getSettingValue<int64_t>("snap-window"));
     }
 
     bool isContinuousMode(PlayerObject* player) {
@@ -79,6 +132,44 @@ namespace {
         if (player->m_isOnGround) return true;
         return player->m_touchingRings && player->m_touchingRings->count() > 0;
     }
+
+    std::filesystem::path referencePath(GJGameLevel* level) {
+        int id = level->m_levelID.value();
+        auto name = id > 0 ? fmt::format("{}.txt", id) : fmt::format("local-{}.txt", level->m_M_ID);
+        return Mod::get()->getSaveDir() / "references" / name;
+    }
+
+    std::vector<RefEvent> loadReference(std::filesystem::path const& path) {
+        std::vector<RefEvent> events;
+        std::ifstream file(path);
+        InputEvent e;
+        int push, player1;
+        while (file >> e.step >> e.button >> push >> player1) {
+            if (e.button < 1 || e.button > kButtonCount) continue;
+            e.push = push != 0;
+            e.isPlayer1 = player1 != 0;
+            events.push_back({ e });
+        }
+        std::stable_sort(events.begin(), events.end(), [](auto const& a, auto const& b) {
+            return a.input.step < b.input.step;
+        });
+        return events;
+    }
+
+    bool saveReference(std::filesystem::path const& path, std::vector<InputEvent> const& events) {
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        std::ofstream file(path, std::ios::trunc);
+        if (!file) return false;
+        for (auto const& e : events) {
+            file << e.step << ' ' << e.button << ' ' << (e.push ? 1 : 0) << ' ' << (e.isPlayer1 ? 1 : 0) << '\n';
+        }
+        return static_cast<bool>(file);
+    }
+
+    void notify(std::string const& text, NotificationIcon icon) {
+        Notification::create(text, icon)->show();
+    }
 }
 
 class $modify(BufferPlayLayer, PlayLayer) {
@@ -86,7 +177,65 @@ class $modify(BufferPlayLayer, PlayLayer) {
         // [0] = player 2 input, [1] = player 1 input (indexed by isPlayer1)
         BufferSlot slots[2][kButtonCount];
         bool firing = false;
+
+        // Physics steps processed this attempt.
+        int step = 0;
+        std::unordered_map<CheckpointObject*, int> checkpointSteps;
+
+        // Record mode
+        std::vector<InputEvent> recorded;
+
+        // Snap mode
+        bool referenceLoaded = false;
+        std::vector<RefEvent> reference;
+        size_t nextToFire = 0;   // first reference event not fired yet
+        size_t firstUnjudged = 0;// first fired event that may still be unmatched
+        bool killPending = false;
+        // Buttons the reference holds at a checkpoint, pressed again on the
+        // first step after respawning there.
+        std::vector<InputEvent> heldAtRespawn;
     };
+
+    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+        if (currentMode() == Mode::Snap) this->ensureReference();
+        return true;
+    }
+
+    // ---- shared ----
+
+    void fire(bool down, int button, bool isPlayer1) {
+        auto fields = m_fields.self();
+        fields->firing = true;
+        this->handleButton(down, button, isPlayer1);
+        fields->firing = false;
+    }
+
+    // Returns true if the event was consumed by the mod.
+    bool onButton(bool down, int button, bool isPlayer1) {
+        if (button < 1 || button > kButtonCount) return false;
+        if (m_fields->firing) return false;
+        if (!m_started || m_hasCompletedLevel) return false;
+
+        switch (currentMode()) {
+            case Mode::Record:
+                m_fields->recorded.push_back({ m_fields->step + 1, button, down, isPlayer1 });
+                return false;
+            case Mode::Snap:
+                return this->onSnapButton(down, button, isPlayer1);
+            case Mode::Buffer:
+                return this->onBufferButton(down, button, isPlayer1);
+        }
+        return false;
+    }
+
+    // Called once per physics step, before the game processes queued input.
+    void onStep() {
+        auto fields = m_fields.self();
+        fields->step++;
+        this->stepBuffer();
+        if (currentMode() == Mode::Snap) this->stepSnap();
+    }
 
     void clearBuffer() {
         auto fields = m_fields.self();
@@ -94,6 +243,86 @@ class $modify(BufferPlayLayer, PlayLayer) {
             for (auto& slot : player) slot = {};
         }
     }
+
+    // Puts every per-attempt state back to fields->step, which is 0 after a
+    // full reset or the checkpoint's step after a checkpoint respawn.
+    void rewindToStep() {
+        auto fields = m_fields.self();
+        int step = fields->step;
+        std::erase_if(fields->recorded, [step](auto const& e) { return e.step > step; });
+
+        fields->killPending = false;
+        fields->nextToFire = 0;
+        fields->heldAtRespawn.clear();
+        bool held[2][kButtonCount] = {};
+        for (auto& ref : fields->reference) {
+            // Events up to the respawn step were fired and judged on the
+            // attempt that reached the checkpoint.
+            ref.matched = ref.input.step <= step;
+            if (ref.input.step <= step) {
+                fields->nextToFire++;
+                held[ref.input.isPlayer1 ? 1 : 0][ref.input.button - 1] = ref.input.push;
+            }
+        }
+        fields->firstUnjudged = fields->nextToFire;
+        if (step > 0) {
+            for (int p = 0; p < 2; ++p) {
+                for (int b = 1; b <= kButtonCount; ++b) {
+                    if (held[p][b - 1]) fields->heldAtRespawn.push_back({ step, b, true, p == 1 });
+                }
+            }
+        }
+    }
+
+    void resetLevel() {
+        auto fields = m_fields.self();
+        this->clearBuffer();
+        fields->step = 0;
+        PlayLayer::resetLevel();
+        // A checkpoint respawn sets fields->step in loadFromCheckpoint.
+        this->clearBuffer();
+        this->rewindToStep();
+    }
+
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        PlayLayer::destroyPlayer(player, object);
+        if (player && player->m_isDead) this->clearBuffer();
+    }
+
+    CheckpointObject* createCheckpoint() {
+        auto checkpoint = PlayLayer::createCheckpoint();
+        if (checkpoint) m_fields->checkpointSteps[checkpoint] = m_fields->step;
+        return checkpoint;
+    }
+
+    void loadFromCheckpoint(CheckpointObject* checkpoint) {
+        PlayLayer::loadFromCheckpoint(checkpoint);
+        auto fields = m_fields.self();
+        auto it = fields->checkpointSteps.find(checkpoint);
+        if (it != fields->checkpointSteps.end()) fields->step = it->second;
+    }
+
+    void removeAllCheckpoints() {
+        PlayLayer::removeAllCheckpoints();
+        m_fields->checkpointSteps.clear();
+    }
+
+    void levelComplete() {
+        if (currentMode() == Mode::Record) {
+            auto path = referencePath(m_level);
+            if (saveReference(path, m_fields->recorded)) {
+                notify(fmt::format("Reference saved ({} inputs)", m_fields->recorded.size()), NotificationIcon::Success);
+                // Pick it up if the player switches to Snap mode on this level.
+                m_fields->referenceLoaded = false;
+            }
+            else {
+                notify("Failed to save reference", NotificationIcon::Error);
+            }
+        }
+        PlayLayer::levelComplete();
+    }
+
+    // ---- Buffer mode ----
 
     BufferSlot& slot(int button, bool isPlayer1) {
         return m_fields->slots[isPlayer1 ? 1 : 0][button - 1];
@@ -117,18 +346,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         return m_player1 && isContinuousMode(m_player1);
     }
 
-    void fire(bool down, int button, bool isPlayer1) {
-        auto fields = m_fields.self();
-        fields->firing = true;
-        this->handleButton(down, button, isPlayer1);
-        fields->firing = false;
-    }
-
-    // Returns true if the event was consumed by the buffer.
-    bool onButton(bool down, int button, bool isPlayer1) {
-        if (button < 1 || button > kButtonCount) return false;
-        if (m_fields->firing) return false;
-
+    bool onBufferButton(bool down, int button, bool isPlayer1) {
         auto& s = slot(button, isPlayer1);
         if (!down) {
             if (s.pending) {
@@ -141,7 +359,6 @@ class $modify(BufferPlayLayer, PlayLayer) {
         int frames = bufferFrames();
         if (frames <= 0) return false;
         if (button != static_cast<int>(PlayerButton::Jump)) return false;
-        if (!m_started || m_hasCompletedLevel) return false;
         if (inputIsContinuous(isPlayer1)) return false;
         if (inputCanAct(isPlayer1)) return false;
 
@@ -153,7 +370,6 @@ class $modify(BufferPlayLayer, PlayLayer) {
         return true;
     }
 
-    // Called once per physics step, before the game processes queued input.
     void stepBuffer() {
         for (int p = 0; p < 2; ++p) {
             bool isPlayer1 = p == 1;
@@ -187,15 +403,91 @@ class $modify(BufferPlayLayer, PlayLayer) {
         }
     }
 
-    void resetLevel() {
-        this->clearBuffer();
-        PlayLayer::resetLevel();
-        this->clearBuffer();
+    // ---- Snap mode ----
+
+    bool ensureReference() {
+        auto fields = m_fields.self();
+        if (!fields->referenceLoaded) {
+            fields->referenceLoaded = true;
+            fields->reference = loadReference(referencePath(m_level));
+            this->rewindToStep();
+            if (fields->reference.empty()) {
+                notify("No reference for this level - record one first", NotificationIcon::Warning);
+            }
+        }
+        return !fields->reference.empty();
     }
 
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
-        PlayLayer::destroyPlayer(player, object);
-        if (player && player->m_isDead) this->clearBuffer();
+    bool onSnapButton(bool down, int button, bool isPlayer1) {
+        // Without a reference, inputs pass through untouched.
+        if (!this->ensureReference()) return false;
+
+        auto fields = m_fields.self();
+        int window = snapWindow();
+        int inputStep = fields->step + 1;
+
+        auto& refs = fields->reference;
+        auto it = std::lower_bound(refs.begin(), refs.end(), inputStep - window, [](RefEvent const& ref, int step) {
+            return ref.input.step < step;
+        });
+
+        RefEvent* best = nullptr;
+        int bestDistance = window + 1;
+        for (; it != refs.end(); ++it) {
+            auto& ref = *it;
+            if (ref.input.step > inputStep + window) break;
+            if (ref.matched) continue;
+            if (ref.input.button != button || ref.input.push != down || ref.input.isPlayer1 != isPlayer1) continue;
+            int distance = std::abs(ref.input.step - inputStep);
+            if (distance < bestDistance) {
+                best = &ref;
+                bestDistance = distance;
+            }
+        }
+
+        if (best) best->matched = true;
+        else fields->killPending = true;
+        // The game only ever sees reference inputs.
+        return true;
+    }
+
+    void stepSnap() {
+        auto fields = m_fields.self();
+        if (fields->reference.empty()) return;
+        int window = snapWindow();
+
+        // Release first so the game sees a fresh press even if it kept the
+        // button held through the respawn.
+        for (auto const& e : fields->heldAtRespawn) {
+            this->fire(false, e.button, e.isPlayer1);
+            this->fire(true, e.button, e.isPlayer1);
+        }
+        fields->heldAtRespawn.clear();
+
+        while (fields->nextToFire < fields->reference.size() &&
+               fields->reference[fields->nextToFire].input.step <= fields->step) {
+            auto const& e = fields->reference[fields->nextToFire].input;
+            fields->nextToFire++;
+            this->fire(e.push, e.button, e.isPlayer1);
+        }
+
+        // A reference input nobody matched within the window is a miss.
+        auto& refs = fields->reference;
+        while (fields->firstUnjudged < fields->nextToFire && refs[fields->firstUnjudged].matched) {
+            fields->firstUnjudged++;
+        }
+        for (size_t i = fields->firstUnjudged; i < fields->nextToFire; ++i) {
+            auto const& ref = refs[i];
+            if (!ref.matched && ref.input.step + window < fields->step) {
+                fields->killPending = true;
+                break;
+            }
+        }
+
+        if (fields->killPending) {
+            fields->killPending = false;
+            if (m_player1 && !m_player1->m_isDead) this->destroyPlayer(m_player1, nullptr);
+        }
     }
 };
 
@@ -214,7 +506,7 @@ class $modify(BufferGameLayer, GJBaseGameLayer) {
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (auto pl = this->bufferLayer()) pl->stepBuffer();
+        if (auto pl = this->bufferLayer()) pl->onStep();
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };

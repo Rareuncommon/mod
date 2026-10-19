@@ -8,15 +8,34 @@
 	},
 	"id": "yourname.input-buffer",
 	"name": "Input Buffer",
-	"version": "v1.0.0",
+	"version": "v1.1.0",
 	"developer": "yourname",
-	"description": "Buffers click inputs for a configurable number of physics steps to make practicing click patterns easier.",
+	"description": "Practice click patterns: buffer early presses, or snap clicks to a recorded reference run and die when they're outside the timing window.",
 	"settings": {
+		"mode": {
+			"type": "string",
+			"name": "Mode",
+			"description": "Buffer: hold early presses until the player can act.\nRecord reference: record your inputs; a completed run is saved as this level's reference.\nSnap to reference: clicks within the snap window of a reference input fire on the reference step; anything else kills the player.",
+			"default": "Buffer",
+			"one-of": [
+				"Buffer",
+				"Snap to reference",
+				"Record reference"
+			]
+		},
 		"buffer-frames": {
 			"type": "int",
 			"name": "Buffer Frames",
 			"description": "How many physics steps a press is held while the player cannot act yet. 0 disables buffering.",
 			"default": 6,
+			"min": 0,
+			"max": 30
+		},
+		"snap-window": {
+			"type": "int",
+			"name": "Snap Window",
+			"description": "Snap mode: how many physics steps early or late an input may be and still count. 0 means it must be exact.",
+			"default": 3,
 			"min": 0,
 			"max": 30
 		}
