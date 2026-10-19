@@ -1,0 +1,24 @@
+{
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "yourname.input-buffer",
+	"name": "Input Buffer",
+	"version": "v1.0.0",
+	"developer": "yourname",
+	"description": "Buffers click inputs for a configurable number of physics steps to make practicing click patterns easier.",
+	"settings": {
+		"buffer-frames": {
+			"type": "int",
+			"name": "Buffer Frames",
+			"description": "How many physics steps a press is held while the player cannot act yet. 0 disables buffering.",
+			"default": 6,
+			"min": 0,
+			"max": 30
+		}
+	}
+}
