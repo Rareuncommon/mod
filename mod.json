@@ -8,10 +8,16 @@
 	},
 	"id": "yourname.input-buffer",
 	"name": "Input Buffer",
-	"version": "v1.2.0",
+	"version": "v1.3.0",
 	"developer": "yourname",
 	"description": "Practice tool for click patterns. Buffer and Snap only work in practice mode or from a start position.",
 	"settings": {
+		"enabled": {
+			"type": "bool",
+			"name": "Enabled",
+			"description": "Turns Buffer, Snap and Record on or off.",
+			"default": true
+		},
 		"mode": {
 			"type": "string",
 			"name": "Mode",
@@ -34,10 +40,37 @@
 		"snap-window": {
 			"type": "int",
 			"name": "Snap Window",
-			"description": "Snap mode: how many physics steps early or late an input may be and still count. 0 means it must be exact.",
-			"default": 3,
+			"description": "Snap mode: how many physics steps early or late an input may be and still count. 0 means it must be exact. At 240 steps per second, 4 steps is about one frame at 60 FPS.",
+			"default": 8,
 			"min": 0,
 			"max": 30
+		},
+		"judge-releases": {
+			"type": "bool",
+			"name": "Judge Releases",
+			"description": "Snap mode: also time button releases against the reference. Off: only presses are judged and releases follow the reference.",
+			"default": false
+		},
+		"toggle-key": {
+			"type": "keybind",
+			"name": "Toggle Hotkey",
+			"description": "Turn the mod on or off. Only works in practice mode or from a start position.",
+			"default": "Alt+I",
+			"category": "gameplay"
+		},
+		"more-help-key": {
+			"type": "keybind",
+			"name": "More Help Hotkey",
+			"description": "Add one step to the buffer (Buffer mode) or snap window (Snap mode).",
+			"default": "Alt+Up",
+			"category": "gameplay"
+		},
+		"less-help-key": {
+			"type": "keybind",
+			"name": "Less Help Hotkey",
+			"description": "Remove one step from the buffer (Buffer mode) or snap window (Snap mode).",
+			"default": "Alt+Down",
+			"category": "gameplay"
 		}
 	}
 }

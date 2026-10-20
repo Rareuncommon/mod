@@ -21,6 +21,11 @@
 // works everywhere since it does not change any input. A label in the corner
 // shows whenever a mode is active.
 //
+// Hotkeys (Geode keybind settings, remappable): toggle the mod, and raise or
+// lower the help steps (buffer-frames in Buffer mode, snap-window in Snap
+// mode). They only respond inside a practice or start position run. The
+// pause menu gets a button that opens the mod's settings.
+//
 // Bindings: geode-sdk/bindings, bindings/2.2081/GeometryDash.bro (Geode SDK 5.11.2).
 // "Inline" = the function body is in bindings/2.2081/inline/*.cpp.
 //
@@ -70,7 +75,8 @@
 //
 // Step counting: one step per GJBaseGameLayer::processCommands call. An input
 // that arrives through handleButton between calls is stamped with the next
-// step. Practice checkpoints keep a copy of the step counter
+// step; one that arrives during a call (if the game routes queued input back
+// through handleButton) is stamped with the current step. Practice checkpoints keep a copy of the step counter
 // (PlayLayer::createCheckpoint / loadFromCheckpoint), so a reference can be
 // recorded and replayed across checkpoint respawns.
 //
@@ -82,6 +88,8 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
+#include <Geode/ui/GeodeUI.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -123,12 +131,28 @@ namespace {
         return Mode::Buffer;
     }
 
+    bool modEnabled() {
+        return Mod::get()->getSettingValue<bool>("enabled");
+    }
+
     int bufferFrames() {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("buffer-frames"));
     }
 
     int snapWindow() {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("snap-window"));
+    }
+
+    bool judgeReleases() {
+        return Mod::get()->getSettingValue<bool>("judge-releases");
+    }
+
+    char const* buttonName(int button, bool push) {
+        switch (button) {
+            case 2: return push ? "left press" : "left release";
+            case 3: return push ? "right press" : "right release";
+            default: return push ? "press" : "release";
+        }
     }
 
     bool isContinuousMode(PlayerObject* player) {
@@ -202,6 +226,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
         size_t nextToFire = 0;   // first reference event not fired yet
         size_t firstUnjudged = 0;// first fired event that may still be unmatched
         bool killPending = false;
+        std::string killReason;
+        bool inStep = false;     // inside GJBaseGameLayer::processCommands
         // Buttons the reference holds at a checkpoint, pressed again on the
         // first step after respawning there.
         std::vector<InputEvent> heldAtRespawn;
@@ -240,7 +266,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         if (!fields->indicator) return;
 
         std::string text;
-        switch (currentMode()) {
+        if (modEnabled()) switch (currentMode()) {
             case Mode::Record:
                 text = "Input Buffer: recording";
                 break;
@@ -272,11 +298,12 @@ class $modify(BufferPlayLayer, PlayLayer) {
     bool onButton(bool down, int button, bool isPlayer1) {
         if (button < 1 || button > kButtonCount) return false;
         if (m_fields->firing) return false;
+        if (!modEnabled()) return false;
         if (!m_started || m_hasCompletedLevel) return false;
 
         switch (currentMode()) {
             case Mode::Record:
-                m_fields->recorded.push_back({ m_fields->step + 1, button, down, isPlayer1 });
+                m_fields->recorded.push_back({ this->inputStep(), button, down, isPlayer1 });
                 return false;
             case Mode::Snap:
                 if (!this->assistAllowed()) return false;
@@ -288,12 +315,21 @@ class $modify(BufferPlayLayer, PlayLayer) {
         return false;
     }
 
+    // The step an input arriving now is processed on.
+    int inputStep() {
+        return m_fields->inStep ? m_fields->step : m_fields->step + 1;
+    }
+
+    void setInStep(bool inStep) {
+        m_fields->inStep = inStep;
+    }
+
     // Called once per physics step, before the game processes queued input.
     void onStep() {
         auto fields = m_fields.self();
         fields->step++;
         this->stepBuffer();
-        if (currentMode() == Mode::Snap && this->assistAllowed()) {
+        if (modEnabled() && currentMode() == Mode::Snap && this->assistAllowed()) {
             if (!fields->referenceLoaded) this->ensureReference();
             this->stepSnap();
         }
@@ -315,6 +351,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         std::erase_if(fields->recorded, [step](auto const& e) { return e.step > step; });
 
         fields->killPending = false;
+        fields->killReason.clear();
         fields->nextToFire = 0;
         fields->heldAtRespawn.clear();
         bool held[2][kButtonCount] = {};
@@ -345,7 +382,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         // A checkpoint respawn sets fields->step in loadFromCheckpoint.
         this->clearBuffer();
         // The start position may have changed, which selects another reference.
-        if (currentMode() == Mode::Snap && this->assistAllowed()) this->ensureReference();
+        if (modEnabled() && currentMode() == Mode::Snap && this->assistAllowed()) this->ensureReference();
         this->rewindToStep();
         this->updateIndicator();
     }
@@ -498,8 +535,11 @@ class $modify(BufferPlayLayer, PlayLayer) {
         if (!this->ensureReference()) return false;
 
         auto fields = m_fields.self();
+        // Releases are only timed when the setting asks for it.
+        if (!down && !judgeReleases()) return true;
+
         int window = snapWindow();
-        int inputStep = fields->step + 1;
+        int inputStep = this->inputStep();
 
         auto& refs = fields->reference;
         auto it = std::lower_bound(refs.begin(), refs.end(), inputStep - window, [](RefEvent const& ref, int step) {
@@ -520,10 +560,45 @@ class $modify(BufferPlayLayer, PlayLayer) {
             }
         }
 
-        if (best) best->matched = true;
-        else fields->killPending = true;
+        if (best) {
+            best->matched = true;
+            log::debug("Snap: {} matched, {:+} steps", buttonName(button, down), inputStep - best->input.step);
+        }
+        else {
+            this->kill(this->describeNoMatch(button, down, isPlayer1, inputStep, window));
+        }
         // The game only ever sees reference inputs.
         return true;
+    }
+
+    // Explains an input with no reference input inside the window, using the
+    // nearest unmatched reference input of the same kind if there is one.
+    std::string describeNoMatch(int button, bool down, bool isPlayer1, int inputStep, int window) {
+        constexpr int kSearch = 240;
+        RefEvent const* nearest = nullptr;
+        for (auto const& ref : m_fields->reference) {
+            if (ref.input.step > inputStep + kSearch) break;
+            if (ref.matched || ref.input.step < inputStep - kSearch) continue;
+            if (ref.input.button != button || ref.input.push != down || ref.input.isPlayer1 != isPlayer1) continue;
+            if (!nearest || std::abs(ref.input.step - inputStep) < std::abs(nearest->input.step - inputStep)) {
+                nearest = &ref;
+            }
+        }
+        if (!nearest) {
+            return fmt::format("Snap: extra {}, no reference input nearby", buttonName(button, down));
+        }
+        int offset = inputStep - nearest->input.step;
+        return fmt::format(
+            "Snap: {} {} steps {} (window {})",
+            buttonName(button, down), std::abs(offset), offset < 0 ? "early" : "late", window
+        );
+    }
+
+    void kill(std::string reason) {
+        auto fields = m_fields.self();
+        if (fields->killPending) return;
+        fields->killPending = true;
+        fields->killReason = std::move(reason);
     }
 
     void stepSnap() {
@@ -541,9 +616,10 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
         while (fields->nextToFire < fields->reference.size() &&
                fields->reference[fields->nextToFire].input.step <= fields->step) {
-            auto const& e = fields->reference[fields->nextToFire].input;
+            auto& ref = fields->reference[fields->nextToFire];
             fields->nextToFire++;
-            this->fire(e.push, e.button, e.isPlayer1);
+            if (!ref.input.push && !judgeReleases()) ref.matched = true;
+            this->fire(ref.input.push, ref.input.button, ref.input.isPlayer1);
         }
 
         // A reference input nobody matched within the window is a miss.
@@ -554,14 +630,18 @@ class $modify(BufferPlayLayer, PlayLayer) {
         for (size_t i = fields->firstUnjudged; i < fields->nextToFire; ++i) {
             auto const& ref = refs[i];
             if (!ref.matched && ref.input.step + window < fields->step) {
-                fields->killPending = true;
+                this->kill(fmt::format("Snap: missed {} (window {})", buttonName(ref.input.button, ref.input.push), window));
                 break;
             }
         }
 
         if (fields->killPending) {
             fields->killPending = false;
-            if (m_player1 && !m_player1->m_isDead) this->destroyPlayer(m_player1, nullptr);
+            log::info("{}", fields->killReason);
+            if (m_player1 && !m_player1->m_isDead) {
+                notify(fields->killReason, NotificationIcon::Error);
+                this->destroyPlayer(m_player1, nullptr);
+            }
         }
     }
 };
@@ -581,7 +661,91 @@ class $modify(BufferGameLayer, GJBaseGameLayer) {
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (auto pl = this->bufferLayer()) pl->onStep();
+        auto pl = this->bufferLayer();
+        if (pl) {
+            pl->onStep();
+            pl->setInStep(true);
+        }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+        if (pl) pl->setInStep(false);
     }
 };
+
+class $modify(BufferPauseLayer, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+
+        CCNode* sprite = CCSprite::createWithSpriteFrameName("GJ_optionsBtn02_001.png");
+        if (!sprite) sprite = CCSprite::createWithSpriteFrameName("GJ_optionsBtn_001.png");
+        if (!sprite) sprite = CCLabelBMFont::create("IB", "bigFont.fnt");
+        sprite->setScale(0.6f);
+        auto button = CCMenuItemSpriteExtra::create(sprite, this, menu_selector(BufferPauseLayer::onInputBufferSettings));
+        button->setID("settings-button"_spr);
+
+        auto menu = CCMenu::create();
+        menu->setID("menu"_spr);
+        menu->addChild(button);
+        menu->setPosition({ 30.f, 30.f });
+        this->addChild(menu, 10);
+    }
+
+    void onInputBufferSettings(CCObject*) {
+        openSettingsPopup(Mod::get());
+    }
+};
+
+namespace {
+    // Hotkeys only act inside a practice or start position run.
+    BufferPlayLayer* hotkeyLayer() {
+        auto pl = static_cast<BufferPlayLayer*>(PlayLayer::get());
+        if (!pl) return nullptr;
+        if (!pl->assistAllowed()) {
+            notify("Input Buffer only works in practice mode or from a start position", NotificationIcon::Warning);
+            return nullptr;
+        }
+        return pl;
+    }
+
+    void adjustHelp(int delta) {
+        auto pl = hotkeyLayer();
+        if (!pl) return;
+
+        char const* key = nullptr;
+        char const* label = nullptr;
+        switch (currentMode()) {
+            case Mode::Buffer: key = "buffer-frames"; label = "Buffer"; break;
+            case Mode::Snap: key = "snap-window"; label = "Snap window"; break;
+            case Mode::Record:
+                notify("Recording - switch to Buffer or Snap to change help steps", NotificationIcon::Info);
+                return;
+        }
+        auto value = Mod::get()->getSettingValue<int64_t>(key);
+        value = std::clamp<int64_t>(value + delta, 0, 30);
+        Mod::get()->setSettingValue<int64_t>(key, value);
+        notify(fmt::format("{}: {} steps", label, value), NotificationIcon::Info);
+        pl->updateIndicator();
+    }
+}
+
+$on_mod(Loaded) {
+    listenForKeybindSettingPresses("toggle-key", [](Keybind const&, bool down, bool repeat, double) {
+        if (!down || repeat) return false;
+        auto pl = hotkeyLayer();
+        if (!pl) return false;
+        bool enabled = !modEnabled();
+        Mod::get()->setSettingValue<bool>("enabled", enabled);
+        notify(enabled ? "Input Buffer: on" : "Input Buffer: off", NotificationIcon::Info);
+        pl->updateIndicator();
+        return true;
+    });
+    listenForKeybindSettingPresses("more-help-key", [](Keybind const&, bool down, bool, double) {
+        if (!down) return false;
+        adjustHelp(1);
+        return true;
+    });
+    listenForKeybindSettingPresses("less-help-key", [](Keybind const&, bool down, bool, double) {
+        if (!down) return false;
+        adjustHelp(-1);
+        return true;
+    });
+}
