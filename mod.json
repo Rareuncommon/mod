@@ -8,14 +8,14 @@
 	},
 	"id": "yourname.input-buffer",
 	"name": "Input Buffer",
-	"version": "v1.1.0",
+	"version": "v1.2.0",
 	"developer": "yourname",
-	"description": "Practice click patterns: buffer early presses, or snap clicks to a recorded reference run and die when they're outside the timing window.",
+	"description": "Practice tool for click patterns. Buffer and Snap only work in practice mode or from a start position.",
 	"settings": {
 		"mode": {
 			"type": "string",
 			"name": "Mode",
-			"description": "Buffer: hold early presses until the player can act.\nRecord reference: record your inputs; a completed run is saved as this level's reference.\nSnap to reference: clicks within the snap window of a reference input fire on the reference step; anything else kills the player.",
+			"description": "Buffer: hold early presses until the player can act.\nRecord reference: record your inputs; a completed run is saved as the reference for this level and start position.\nSnap to reference: clicks within the snap window of a reference input fire on the reference step; anything else kills the player.\nBuffer and Snap only work in practice mode or from a start position.",
 			"default": "Buffer",
 			"one-of": [
 				"Buffer",

@@ -15,6 +15,12 @@
 //                      and every reference event must be matched within the
 //                      window, otherwise the player is killed.
 //
+// Buffer and Snap only act in practice mode or when the level was started
+// from a start position (GJBaseGameLayer::m_isPracticeMode, m_isTestMode,
+// m_startPosObject); in a normal run inputs pass through untouched. Record
+// works everywhere since it does not change any input. A label in the corner
+// shows whenever a mode is active.
+//
 // Bindings: geode-sdk/bindings, bindings/2.2081/GeometryDash.bro (Geode SDK 5.11.2).
 // "Inline" = the function body is in bindings/2.2081/inline/*.cpp.
 //
@@ -68,7 +74,9 @@
 // (PlayLayer::createCheckpoint / loadFromCheckpoint), so a reference can be
 // recorded and replayed across checkpoint respawns.
 //
-// Reference files: <mod save dir>/references/<level>.txt, one event per line:
+// Reference files: <mod save dir>/references/<level>[-sp<x>].txt, one per
+// level and start position (keyed by the start position's x coordinate),
+// since step counting starts over at the start position. One event per line:
 //   <step> <button 1-3> <push 0/1> <player1 0/1>
 
 #include <Geode/Geode.hpp>
@@ -76,6 +84,7 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <unordered_map>
 #include <vector>
@@ -133,10 +142,11 @@ namespace {
         return player->m_touchingRings && player->m_touchingRings->count() > 0;
     }
 
-    std::filesystem::path referencePath(GJGameLevel* level) {
+    std::filesystem::path referencePath(GJGameLevel* level, StartPosObject* startPos) {
         int id = level->m_levelID.value();
-        auto name = id > 0 ? fmt::format("{}.txt", id) : fmt::format("local-{}.txt", level->m_M_ID);
-        return Mod::get()->getSaveDir() / "references" / name;
+        auto name = id > 0 ? fmt::format("{}", id) : fmt::format("local-{}", level->m_M_ID);
+        if (startPos) name += fmt::format("-sp{}", static_cast<int>(std::round(startPos->getPositionX())));
+        return Mod::get()->getSaveDir() / "references" / (name + ".txt");
     }
 
     std::vector<RefEvent> loadReference(std::filesystem::path const& path) {
@@ -187,6 +197,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
         // Snap mode
         bool referenceLoaded = false;
+        std::filesystem::path referenceFile;
         std::vector<RefEvent> reference;
         size_t nextToFire = 0;   // first reference event not fired yet
         size_t firstUnjudged = 0;// first fired event that may still be unmatched
@@ -194,15 +205,61 @@ class $modify(BufferPlayLayer, PlayLayer) {
         // Buttons the reference holds at a checkpoint, pressed again on the
         // first step after respawning there.
         std::vector<InputEvent> heldAtRespawn;
+
+        CCLabelBMFont* indicator = nullptr;
+        std::string indicatorText;
     };
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        if (currentMode() == Mode::Snap) this->ensureReference();
+
+        auto winSize = CCDirector::get()->getWinSize();
+        auto label = CCLabelBMFont::create("", "bigFont.fnt");
+        label->setScale(0.35f);
+        label->setOpacity(160);
+        label->setAnchorPoint({ 1.f, 0.f });
+        label->setPosition({ winSize.width - 5.f, 5.f });
+        label->setVisible(false);
+        label->setID("input-buffer-indicator"_spr);
+        this->addChild(label, 1000);
+        m_fields->indicator = label;
+
+        this->updateIndicator();
         return true;
     }
 
     // ---- shared ----
+
+    // Buffer and Snap only run where a completion cannot count as a normal run.
+    bool assistAllowed() {
+        return m_isPracticeMode || m_isTestMode || m_startPosObject;
+    }
+
+    void updateIndicator() {
+        auto fields = m_fields.self();
+        if (!fields->indicator) return;
+
+        std::string text;
+        switch (currentMode()) {
+            case Mode::Record:
+                text = "Input Buffer: recording";
+                break;
+            case Mode::Buffer:
+                if (this->assistAllowed() && bufferFrames() > 0) {
+                    text = fmt::format("Input Buffer: {} steps", bufferFrames());
+                }
+                break;
+            case Mode::Snap:
+                if (this->assistAllowed() && !fields->reference.empty()) {
+                    text = fmt::format("Input Buffer: snap +/-{}", snapWindow());
+                }
+                break;
+        }
+        if (text == fields->indicatorText) return;
+        fields->indicatorText = text;
+        fields->indicator->setString(text.c_str());
+        fields->indicator->setVisible(!text.empty());
+    }
 
     void fire(bool down, int button, bool isPlayer1) {
         auto fields = m_fields.self();
@@ -222,8 +279,10 @@ class $modify(BufferPlayLayer, PlayLayer) {
                 m_fields->recorded.push_back({ m_fields->step + 1, button, down, isPlayer1 });
                 return false;
             case Mode::Snap:
+                if (!this->assistAllowed()) return false;
                 return this->onSnapButton(down, button, isPlayer1);
             case Mode::Buffer:
+                if (!this->assistAllowed()) return false;
                 return this->onBufferButton(down, button, isPlayer1);
         }
         return false;
@@ -234,7 +293,11 @@ class $modify(BufferPlayLayer, PlayLayer) {
         auto fields = m_fields.self();
         fields->step++;
         this->stepBuffer();
-        if (currentMode() == Mode::Snap) this->stepSnap();
+        if (currentMode() == Mode::Snap && this->assistAllowed()) {
+            if (!fields->referenceLoaded) this->ensureReference();
+            this->stepSnap();
+        }
+        this->updateIndicator();
     }
 
     void clearBuffer() {
@@ -281,7 +344,10 @@ class $modify(BufferPlayLayer, PlayLayer) {
         PlayLayer::resetLevel();
         // A checkpoint respawn sets fields->step in loadFromCheckpoint.
         this->clearBuffer();
+        // The start position may have changed, which selects another reference.
+        if (currentMode() == Mode::Snap && this->assistAllowed()) this->ensureReference();
         this->rewindToStep();
+        this->updateIndicator();
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
@@ -309,9 +375,13 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
     void levelComplete() {
         if (currentMode() == Mode::Record) {
-            auto path = referencePath(m_level);
+            auto path = referencePath(m_level, m_startPosObject);
             if (saveReference(path, m_fields->recorded)) {
-                notify(fmt::format("Reference saved ({} inputs)", m_fields->recorded.size()), NotificationIcon::Success);
+                notify(fmt::format(
+                    "Reference saved{} ({} inputs)",
+                    m_startPosObject ? " for this start position" : "",
+                    m_fields->recorded.size()
+                ), NotificationIcon::Success);
                 // Pick it up if the player switches to Snap mode on this level.
                 m_fields->referenceLoaded = false;
             }
@@ -407,12 +477,17 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
     bool ensureReference() {
         auto fields = m_fields.self();
-        if (!fields->referenceLoaded) {
+        auto path = referencePath(m_level, m_startPosObject);
+        if (!fields->referenceLoaded || fields->referenceFile != path) {
             fields->referenceLoaded = true;
-            fields->reference = loadReference(referencePath(m_level));
+            fields->referenceFile = path;
+            fields->reference = loadReference(path);
             this->rewindToStep();
             if (fields->reference.empty()) {
-                notify("No reference for this level - record one first", NotificationIcon::Warning);
+                notify(m_startPosObject
+                    ? "No reference for this start position - record one first"
+                    : "No reference for this level - record one first",
+                    NotificationIcon::Warning);
             }
         }
         return !fields->reference.empty();
