@@ -1,14 +1,11 @@
 // Input Buffer
 //
-// Three modes, chosen by the "mode" setting:
+// Two modes, chosen by the "mode" setting:
 //
 //   Buffer             Holds a PlayerButton press for up to `buffer-frames`
 //                      physics steps while the player cannot act on it yet,
 //                      then fires it on the first step the player can.
-//   Record reference   Records every PlayerButton event with the physics step
-//                      it is processed on. A completed run is saved as the
-//                      level's reference.
-//   Snap to reference  Only touches inputs in the short window before a
+//   Snap to best run   Only touches inputs in the short window before a
 //                      reference input. A press or release that comes up to
 //                      `snap-window` steps before a reference input of the
 //                      same kind (button, press/release, player) is held and
@@ -18,11 +15,17 @@
 //                      ahead, reaches the game unchanged. Nothing is fired
 //                      that the player did not press.
 //
+// Best run (the reference): every attempt's inputs, as the game received
+// them, are recorded automatically. When an attempt gets further than the
+// saved best run for this level and start position (completions beat any
+// death), it replaces it. A died attempt drops its last kDeathTrimSteps steps
+// of inputs, since those likely caused the death.
+//
 // Buffer and Snap only act in practice mode or when the level was started
 // from a start position (GJBaseGameLayer::m_isPracticeMode, m_isTestMode,
-// m_startPosObject); in a normal run inputs pass through untouched. Record
-// works everywhere since it does not change any input. A label in the corner
-// shows whenever a mode is active.
+// m_startPosObject); in a normal run inputs pass through untouched. Recording
+// the best run works everywhere since it does not change any input. A label
+// in the corner shows whenever Buffer or Snap is active.
 //
 // Hotkeys (Geode keybind settings, remappable): toggle the mod, and raise or
 // lower the help steps (buffer-frames in Buffer mode, snap-window in Snap
@@ -90,7 +93,8 @@
 //
 // Reference files: <mod save dir>/references/<level>[-sp<x>].txt, one per
 // level and start position (keyed by the start position's x coordinate),
-// since step counting starts over at the start position. One event per line:
+// since step counting starts over at the start position. First line
+// "# length <steps> completed <0/1>", then one event per line:
 //   <step> <button 1-3> <push 0/1> <player1 0/1>
 
 #include <Geode/Geode.hpp>
@@ -102,6 +106,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -111,7 +116,10 @@ namespace {
     // PlayerButton is Jump = 1, Left = 2, Right = 3 (Geode/Enums.hpp).
     constexpr int kButtonCount = 3;
 
-    enum class Mode { Buffer, Snap, Record };
+    enum class Mode { Buffer, Snap };
+
+    // Inputs this close to the death of a died attempt are not saved.
+    constexpr int kDeathTrimSteps = 60;
 
     struct BufferSlot {
         bool pending = false;        // a press is being held back
@@ -140,8 +148,7 @@ namespace {
 
     Mode currentMode() {
         auto mode = Mod::get()->getSettingValue<std::string>("mode");
-        if (mode == "Snap to reference") return Mode::Snap;
-        if (mode == "Record reference") return Mode::Record;
+        if (mode == "Snap to best run") return Mode::Snap;
         return Mode::Buffer;
     }
 
@@ -183,28 +190,51 @@ namespace {
         return Mod::get()->getSaveDir() / "references" / (name + ".txt");
     }
 
-    std::vector<RefEvent> loadReference(std::filesystem::path const& path) {
+    struct Reference {
         std::vector<RefEvent> events;
+        int length = 0;          // steps the run lasted
+        bool completed = false;  // the run reached the end of the level
+    };
+
+    // How good a run is: a completion beats any death, then further is better.
+    bool isBetterRun(int length, bool completed, Reference const& than) {
+        if (completed != than.completed) return completed;
+        return length > than.length;
+    }
+
+    Reference loadReference(std::filesystem::path const& path) {
+        Reference ref;
         std::ifstream file(path);
-        InputEvent e;
-        int push, player1;
-        while (file >> e.step >> e.button >> push >> player1) {
+        std::string line;
+        while (std::getline(file, line)) {
+            std::istringstream in(line);
+            if (line.starts_with("#")) {
+                std::string hash, lengthKey, completedKey;
+                int completed = 0;
+                in >> hash >> lengthKey >> ref.length >> completedKey >> completed;
+                ref.completed = completed != 0;
+                continue;
+            }
+            InputEvent e;
+            int push, player1;
+            if (!(in >> e.step >> e.button >> push >> player1)) continue;
             if (e.button < 1 || e.button > kButtonCount) continue;
             e.push = push != 0;
             e.isPlayer1 = player1 != 0;
-            events.push_back({ e });
+            ref.events.push_back({ e });
         }
-        std::stable_sort(events.begin(), events.end(), [](auto const& a, auto const& b) {
+        std::stable_sort(ref.events.begin(), ref.events.end(), [](auto const& a, auto const& b) {
             return a.input.step < b.input.step;
         });
-        return events;
+        return ref;
     }
 
-    bool saveReference(std::filesystem::path const& path, std::vector<InputEvent> const& events) {
+    bool saveReference(std::filesystem::path const& path, std::vector<InputEvent> const& events, int length, bool completed) {
         std::error_code ec;
         std::filesystem::create_directories(path.parent_path(), ec);
         std::ofstream file(path, std::ios::trunc);
         if (!file) return false;
+        file << "# length " << length << " completed " << (completed ? 1 : 0) << '\n';
         for (auto const& e : events) {
             file << e.step << ' ' << e.button << ' ' << (e.push ? 1 : 0) << ' ' << (e.isPlayer1 ? 1 : 0) << '\n';
         }
@@ -226,13 +256,16 @@ class $modify(BufferPlayLayer, PlayLayer) {
         int step = 0;
         std::unordered_map<CheckpointObject*, int> checkpointSteps;
 
-        // Record mode
+        // Inputs the game received this attempt, for the best run.
         std::vector<InputEvent> recorded;
+        bool attemptSaved = false;
 
-        // Snap mode
+        // Best run for the current level and start position.
         bool referenceLoaded = false;
         std::filesystem::path referenceFile;
         std::vector<RefEvent> reference;
+        int referenceLength = 0;
+        bool referenceCompleted = false;
         std::vector<InputEvent> scheduled; // snapped inputs waiting for their step
         SnapHold holds[2][kButtonCount];   // indexed like slots
 
@@ -273,17 +306,16 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
         std::string text;
         if (modEnabled()) switch (currentMode()) {
-            case Mode::Record:
-                text = "Input Buffer: recording";
-                break;
             case Mode::Buffer:
                 if (this->assistAllowed() && bufferFrames() > 0) {
                     text = fmt::format("Input Buffer: {} steps", bufferFrames());
                 }
                 break;
             case Mode::Snap:
-                if (this->assistAllowed() && !fields->reference.empty()) {
-                    text = fmt::format("Input Buffer: snap {} steps", snapWindow());
+                if (this->assistAllowed()) {
+                    text = fields->reference.empty()
+                        ? fmt::format("Input Buffer: snap {} steps (no best run yet)", snapWindow())
+                        : fmt::format("Input Buffer: snap {} steps", snapWindow());
                 }
                 break;
         }
@@ -308,9 +340,6 @@ class $modify(BufferPlayLayer, PlayLayer) {
         if (!m_started || m_hasCompletedLevel) return false;
 
         switch (currentMode()) {
-            case Mode::Record:
-                m_fields->recorded.push_back({ this->inputStep(), button, down, isPlayer1 });
-                return false;
             case Mode::Snap:
                 if (!this->assistAllowed()) return false;
                 return this->onSnapButton(down, button, isPlayer1);
@@ -319,6 +348,43 @@ class $modify(BufferPlayLayer, PlayLayer) {
                 return this->onBufferButton(down, button, isPlayer1);
         }
         return false;
+    }
+
+    // Every input that reaches the game, including ones the mod fired.
+    void recordInput(bool down, int button, bool isPlayer1) {
+        if (button < 1 || button > kButtonCount) return;
+        if (!m_started || m_hasCompletedLevel) return;
+        m_fields->recorded.push_back({ this->inputStep(), button, down, isPlayer1 });
+    }
+
+    // Saves this attempt as the best run if it got further than the saved one.
+    void considerSaving(bool completed) {
+        auto fields = m_fields.self();
+        if (fields->attemptSaved) return;
+        fields->attemptSaved = true;
+
+        this->ensureReference();
+        int length = fields->step;
+        Reference current;
+        current.length = fields->referenceLength;
+        current.completed = fields->referenceCompleted;
+        if (!isBetterRun(length, completed, current)) return;
+
+        std::vector<InputEvent> events = fields->recorded;
+        if (!completed) {
+            int cutoff = length - kDeathTrimSteps;
+            std::erase_if(events, [cutoff](auto const& e) { return e.step > cutoff; });
+        }
+        if (events.empty() && !completed) return;
+
+        if (saveReference(fields->referenceFile, events, length, completed)) {
+            log::info("Saved best run: {} steps, {} inputs, completed {}", length, events.size(), completed);
+            // Loaded again on the next reset, so the current attempt is unaffected.
+            fields->referenceLoaded = false;
+        }
+        else {
+            log::warn("Failed to save best run to {}", fields->referenceFile);
+        }
     }
 
     // The step an input arriving now is processed on.
@@ -372,15 +438,19 @@ class $modify(BufferPlayLayer, PlayLayer) {
         PlayLayer::resetLevel();
         // A checkpoint respawn sets fields->step in loadFromCheckpoint.
         this->clearBuffer();
-        // The start position may have changed, which selects another reference.
-        if (modEnabled() && currentMode() == Mode::Snap && this->assistAllowed()) this->ensureReference();
+        fields->attemptSaved = false;
+        // The start position may have changed, which selects another best run.
+        this->ensureReference();
         this->rewindToStep();
         this->updateIndicator();
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         PlayLayer::destroyPlayer(player, object);
-        if (player && player->m_isDead) this->clearBuffer();
+        if (player && player->m_isDead) {
+            this->clearBuffer();
+            this->considerSaving(false);
+        }
     }
 
     CheckpointObject* createCheckpoint() {
@@ -402,21 +472,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
     }
 
     void levelComplete() {
-        if (currentMode() == Mode::Record) {
-            auto path = referencePath(m_level, m_startPosObject);
-            if (saveReference(path, m_fields->recorded)) {
-                notify(fmt::format(
-                    "Reference saved{} ({} inputs)",
-                    m_startPosObject ? " for this start position" : "",
-                    m_fields->recorded.size()
-                ), NotificationIcon::Success);
-                // Pick it up if the player switches to Snap mode on this level.
-                m_fields->referenceLoaded = false;
-            }
-            else {
-                notify("Failed to save reference", NotificationIcon::Error);
-            }
-        }
+        this->considerSaving(true);
         PlayLayer::levelComplete();
     }
 
@@ -501,7 +557,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         }
     }
 
-    // ---- Snap mode ----
+    // ---- Snap mode / best run ----
 
     bool ensureReference() {
         auto fields = m_fields.self();
@@ -509,14 +565,14 @@ class $modify(BufferPlayLayer, PlayLayer) {
         if (!fields->referenceLoaded || fields->referenceFile != path) {
             fields->referenceLoaded = true;
             fields->referenceFile = path;
-            fields->reference = loadReference(path);
-            this->rewindToStep();
-            if (fields->reference.empty()) {
-                notify(m_startPosObject
-                    ? "No reference for this start position - record one first"
-                    : "No reference for this level - record one first",
-                    NotificationIcon::Warning);
-            }
+            auto ref = loadReference(path);
+            fields->reference = std::move(ref.events);
+            fields->referenceLength = ref.length;
+            fields->referenceCompleted = ref.completed;
+            // Only the snap state is rewound here; the attempt's recording
+            // must survive a reload.
+            int step = fields->step;
+            for (auto& r : fields->reference) r.matched = r.input.step <= step;
         }
         return !fields->reference.empty();
     }
@@ -615,8 +671,10 @@ class $modify(BufferGameLayer, GJBaseGameLayer) {
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
-        if (auto pl = this->bufferLayer()) {
+        auto pl = this->bufferLayer();
+        if (pl) {
             if (pl->onButton(down, button, isPlayer1)) return;
+            pl->recordInput(down, button, isPlayer1);
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
@@ -624,8 +682,9 @@ class $modify(BufferGameLayer, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto pl = this->bufferLayer();
         if (pl) {
-            pl->onStep();
+            // Inputs fired from onStep are processed on this step.
             pl->setInStep(true);
+            pl->onStep();
         }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         if (pl) pl->setInStep(false);
@@ -676,9 +735,6 @@ namespace {
         switch (currentMode()) {
             case Mode::Buffer: key = "buffer-frames"; label = "Buffer"; break;
             case Mode::Snap: key = "snap-window"; label = "Snap window"; break;
-            case Mode::Record:
-                notify("Recording - switch to Buffer or Snap to change help steps", NotificationIcon::Info);
-                return;
         }
         auto value = Mod::get()->getSettingValue<int64_t>(key);
         value = std::clamp<int64_t>(value + delta, 0, 30);

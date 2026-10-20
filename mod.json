@@ -8,25 +8,24 @@
 	},
 	"id": "yourname.input-buffer",
 	"name": "Input Buffer",
-	"version": "v1.4.0",
+	"version": "v1.5.0",
 	"developer": "yourname",
 	"description": "Practice tool for click patterns. Buffer and Snap only work in practice mode or from a start position.",
 	"settings": {
 		"enabled": {
 			"type": "bool",
 			"name": "Enabled",
-			"description": "Turns Buffer, Snap and Record on or off.",
+			"description": "Turns Buffer and Snap on or off. Your best run is still saved while off.",
 			"default": true
 		},
 		"mode": {
 			"type": "string",
 			"name": "Mode",
-			"description": "Buffer: hold early presses until the player can act.\nRecord reference: record your inputs; a completed run is saved as the reference for this level and start position.\nSnap to reference: a click that comes within the snap window before a click in the reference is held and fired at the right moment. Every other click works as normal.\nBuffer and Snap only work in practice mode or from a start position.",
+			"description": "Buffer: hold early presses until the player can act.\nSnap to best run: a click that comes within the snap window before a click from your best run is held and fired at the right moment. Every other click works as normal. Your furthest attempt from each start position is saved as the best run automatically.\nBuffer and Snap only work in practice mode or from a start position.",
 			"default": "Buffer",
 			"one-of": [
 				"Buffer",
-				"Snap to reference",
-				"Record reference"
+				"Snap to best run"
 			]
 		},
 		"buffer-frames": {
@@ -40,7 +39,7 @@
 		"snap-window": {
 			"type": "int",
 			"name": "Snap Window",
-			"description": "Snap mode: how many physics steps before a reference click your click may come and still be moved onto it. At 240 steps per second, 4 steps is about one frame at 60 FPS.",
+			"description": "Snap mode: how many physics steps before a click from your best run your click may come and still be moved onto it. At 240 steps per second, 4 steps is about one frame at 60 FPS.",
 			"default": 4,
 			"min": 0,
 			"max": 30
