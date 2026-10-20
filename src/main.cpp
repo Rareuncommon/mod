@@ -8,12 +8,15 @@
 //   Record reference   Records every PlayerButton event with the physics step
 //                      it is processed on. A completed run is saved as the
 //                      level's reference.
-//   Snap to reference  Player input never reaches the game directly. Each
-//                      reference event fires on its own step. Every player
-//                      input must match a reference event (same button,
-//                      press/release and player) within `snap-window` steps,
-//                      and every reference event must be matched within the
-//                      window, otherwise the player is killed.
+//   Snap to reference  Only touches inputs in the short window before a
+//                      reference input. A press or release that comes up to
+//                      `snap-window` steps before a reference input of the
+//                      same kind (button, press/release, player) is held and
+//                      fired on the reference step, which puts the player
+//                      back on the recorded path. Any other input, early by
+//                      more than the window, late, or with no reference input
+//                      ahead, reaches the game unchanged. Nothing is fired
+//                      that the player did not press.
 //
 // Buffer and Snap only act in practice mode or when the level was started
 // from a start position (GJBaseGameLayer::m_isPracticeMode, m_isTestMode,
@@ -65,6 +68,10 @@
 // has no state to wait for. Snap mode covers them, and every other mode,
 // because it times inputs against the reference instead of the player state.
 //
+// Snap releases: a release that arrives while its press is still held back
+// is shifted by the same number of steps as the press (so the hold length is
+// kept), then snapped to a reference release if one is within the window.
+//
 // Left/Right (platformer movement) pass through in Buffer mode and are
 // snapped like any other button in Snap mode.
 //
@@ -76,9 +83,10 @@
 // Step counting: one step per GJBaseGameLayer::processCommands call. An input
 // that arrives through handleButton between calls is stamped with the next
 // step; one that arrives during a call (if the game routes queued input back
-// through handleButton) is stamped with the current step. Practice checkpoints keep a copy of the step counter
-// (PlayLayer::createCheckpoint / loadFromCheckpoint), so a reference can be
-// recorded and replayed across checkpoint respawns.
+// through handleButton) is stamped with the current step. Practice
+// checkpoints keep a copy of the step counter (PlayLayer::createCheckpoint /
+// loadFromCheckpoint), so a reference can be recorded and used across
+// checkpoint respawns.
 //
 // Reference files: <mod save dir>/references/<level>[-sp<x>].txt, one per
 // level and start position (keyed by the start position's x coordinate),
@@ -121,7 +129,13 @@ namespace {
 
     struct RefEvent {
         InputEvent input;
-        bool matched = false;
+        bool matched = false;   // already used to snap a player input
+    };
+
+    struct SnapHold {
+        bool pressPending = false; // a snapped press has not fired yet
+        int pressStep = 0;         // step the snapped press fires on
+        int shift = 0;             // steps the press was moved by
     };
 
     Mode currentMode() {
@@ -141,10 +155,6 @@ namespace {
 
     int snapWindow() {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("snap-window"));
-    }
-
-    bool judgeReleases() {
-        return Mod::get()->getSettingValue<bool>("judge-releases");
     }
 
     char const* buttonName(int button, bool push) {
@@ -223,14 +233,10 @@ class $modify(BufferPlayLayer, PlayLayer) {
         bool referenceLoaded = false;
         std::filesystem::path referenceFile;
         std::vector<RefEvent> reference;
-        size_t nextToFire = 0;   // first reference event not fired yet
-        size_t firstUnjudged = 0;// first fired event that may still be unmatched
-        bool killPending = false;
-        std::string killReason;
+        std::vector<InputEvent> scheduled; // snapped inputs waiting for their step
+        SnapHold holds[2][kButtonCount];   // indexed like slots
+
         bool inStep = false;     // inside GJBaseGameLayer::processCommands
-        // Buttons the reference holds at a checkpoint, pressed again on the
-        // first step after respawning there.
-        std::vector<InputEvent> heldAtRespawn;
 
         CCLabelBMFont* indicator = nullptr;
         std::string indicatorText;
@@ -277,7 +283,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
                 break;
             case Mode::Snap:
                 if (this->assistAllowed() && !fields->reference.empty()) {
-                    text = fmt::format("Input Buffer: snap +/-{}", snapWindow());
+                    text = fmt::format("Input Buffer: snap {} steps", snapWindow());
                 }
                 break;
         }
@@ -350,27 +356,12 @@ class $modify(BufferPlayLayer, PlayLayer) {
         int step = fields->step;
         std::erase_if(fields->recorded, [step](auto const& e) { return e.step > step; });
 
-        fields->killPending = false;
-        fields->killReason.clear();
-        fields->nextToFire = 0;
-        fields->heldAtRespawn.clear();
-        bool held[2][kButtonCount] = {};
-        for (auto& ref : fields->reference) {
-            // Events up to the respawn step were fired and judged on the
-            // attempt that reached the checkpoint.
-            ref.matched = ref.input.step <= step;
-            if (ref.input.step <= step) {
-                fields->nextToFire++;
-                held[ref.input.isPlayer1 ? 1 : 0][ref.input.button - 1] = ref.input.push;
-            }
+        fields->scheduled.clear();
+        for (auto& player : fields->holds) {
+            for (auto& hold : player) hold = {};
         }
-        fields->firstUnjudged = fields->nextToFire;
-        if (step > 0) {
-            for (int p = 0; p < 2; ++p) {
-                for (int b = 1; b <= kButtonCount; ++b) {
-                    if (held[p][b - 1]) fields->heldAtRespawn.push_back({ step, b, true, p == 1 });
-                }
-            }
+        for (auto& ref : fields->reference) {
+            ref.matched = ref.input.step <= step;
         }
     }
 
@@ -530,118 +521,88 @@ class $modify(BufferPlayLayer, PlayLayer) {
         return !fields->reference.empty();
     }
 
+    SnapHold& hold(int button, bool isPlayer1) {
+        return m_fields->holds[isPlayer1 ? 1 : 0][button - 1];
+    }
+
+    // First unused reference input of this kind on a step in [from, to].
+    RefEvent* findReference(int button, bool push, bool isPlayer1, int from, int to) {
+        auto& refs = m_fields->reference;
+        auto it = std::lower_bound(refs.begin(), refs.end(), from, [](RefEvent const& ref, int step) {
+            return ref.input.step < step;
+        });
+        for (; it != refs.end() && it->input.step <= to; ++it) {
+            if (it->matched) continue;
+            if (it->input.button != button || it->input.push != push || it->input.isPlayer1 != isPlayer1) continue;
+            return &*it;
+        }
+        return nullptr;
+    }
+
+    void schedule(int step, int button, bool push, bool isPlayer1) {
+        auto& scheduled = m_fields->scheduled;
+        InputEvent e { step, button, push, isPlayer1 };
+        auto it = std::upper_bound(scheduled.begin(), scheduled.end(), step, [](int step, InputEvent const& e) {
+            return step < e.step;
+        });
+        scheduled.insert(it, e);
+    }
+
     bool onSnapButton(bool down, int button, bool isPlayer1) {
         // Without a reference, inputs pass through untouched.
         if (!this->ensureReference()) return false;
 
-        auto fields = m_fields.self();
-        // Releases are only timed when the setting asks for it.
-        if (!down && !judgeReleases()) return true;
-
         int window = snapWindow();
         int inputStep = this->inputStep();
+        auto& h = hold(button, isPlayer1);
 
-        auto& refs = fields->reference;
-        auto it = std::lower_bound(refs.begin(), refs.end(), inputStep - window, [](RefEvent const& ref, int step) {
-            return ref.input.step < step;
-        });
-
-        RefEvent* best = nullptr;
-        int bestDistance = window + 1;
-        for (; it != refs.end(); ++it) {
-            auto& ref = *it;
-            if (ref.input.step > inputStep + window) break;
-            if (ref.matched) continue;
-            if (ref.input.button != button || ref.input.push != down || ref.input.isPlayer1 != isPlayer1) continue;
-            int distance = std::abs(ref.input.step - inputStep);
-            if (distance < bestDistance) {
-                best = &ref;
-                bestDistance = distance;
+        // Released before the snapped press fired: keep the hold length,
+        // never release before the press, and snap to a reference release
+        // if one is in the window.
+        if (!down && h.pressPending) {
+            int target = std::max(inputStep + h.shift, h.pressStep + 1);
+            if (auto ref = this->findReference(button, false, isPlayer1, target, target + window)) {
+                ref->matched = true;
+                target = ref->input.step;
             }
+            h.pressPending = false;
+            this->schedule(target, button, false, isPlayer1);
+            log::debug("Snap: {} moved to step {}", buttonName(button, down), target);
+            return true;
         }
 
-        if (best) {
-            best->matched = true;
-            log::debug("Snap: {} matched, {:+} steps", buttonName(button, down), inputStep - best->input.step);
+        auto ref = this->findReference(button, down, isPlayer1, inputStep, inputStep + window);
+        if (!ref) return false;
+
+        ref->matched = true;
+        int target = ref->input.step;
+        if (target == inputStep) return false;
+
+        this->schedule(target, button, down, isPlayer1);
+        if (down) {
+            h.pressPending = true;
+            h.pressStep = target;
+            h.shift = target - inputStep;
         }
-        else {
-            this->kill(this->describeNoMatch(button, down, isPlayer1, inputStep, window));
-        }
-        // The game only ever sees reference inputs.
+        log::debug("Snap: {} {} steps early, moved to step {}", buttonName(button, down), target - inputStep, target);
         return true;
-    }
-
-    // Explains an input with no reference input inside the window, using the
-    // nearest unmatched reference input of the same kind if there is one.
-    std::string describeNoMatch(int button, bool down, bool isPlayer1, int inputStep, int window) {
-        constexpr int kSearch = 240;
-        RefEvent const* nearest = nullptr;
-        for (auto const& ref : m_fields->reference) {
-            if (ref.input.step > inputStep + kSearch) break;
-            if (ref.matched || ref.input.step < inputStep - kSearch) continue;
-            if (ref.input.button != button || ref.input.push != down || ref.input.isPlayer1 != isPlayer1) continue;
-            if (!nearest || std::abs(ref.input.step - inputStep) < std::abs(nearest->input.step - inputStep)) {
-                nearest = &ref;
-            }
-        }
-        if (!nearest) {
-            return fmt::format("Snap: extra {}, no reference input nearby", buttonName(button, down));
-        }
-        int offset = inputStep - nearest->input.step;
-        return fmt::format(
-            "Snap: {} {} steps {} (window {})",
-            buttonName(button, down), std::abs(offset), offset < 0 ? "early" : "late", window
-        );
-    }
-
-    void kill(std::string reason) {
-        auto fields = m_fields.self();
-        if (fields->killPending) return;
-        fields->killPending = true;
-        fields->killReason = std::move(reason);
     }
 
     void stepSnap() {
         auto fields = m_fields.self();
-        if (fields->reference.empty()) return;
-        int window = snapWindow();
+        auto& scheduled = fields->scheduled;
+        size_t count = 0;
+        while (count < scheduled.size() && scheduled[count].step <= fields->step) ++count;
+        if (count == 0) return;
 
-        // Release first so the game sees a fresh press even if it kept the
-        // button held through the respawn.
-        for (auto const& e : fields->heldAtRespawn) {
-            this->fire(false, e.button, e.isPlayer1);
-            this->fire(true, e.button, e.isPlayer1);
-        }
-        fields->heldAtRespawn.clear();
-
-        while (fields->nextToFire < fields->reference.size() &&
-               fields->reference[fields->nextToFire].input.step <= fields->step) {
-            auto& ref = fields->reference[fields->nextToFire];
-            fields->nextToFire++;
-            if (!ref.input.push && !judgeReleases()) ref.matched = true;
-            this->fire(ref.input.push, ref.input.button, ref.input.isPlayer1);
-        }
-
-        // A reference input nobody matched within the window is a miss.
-        auto& refs = fields->reference;
-        while (fields->firstUnjudged < fields->nextToFire && refs[fields->firstUnjudged].matched) {
-            fields->firstUnjudged++;
-        }
-        for (size_t i = fields->firstUnjudged; i < fields->nextToFire; ++i) {
-            auto const& ref = refs[i];
-            if (!ref.matched && ref.input.step + window < fields->step) {
-                this->kill(fmt::format("Snap: missed {} (window {})", buttonName(ref.input.button, ref.input.push), window));
-                break;
+        std::vector<InputEvent> due(scheduled.begin(), scheduled.begin() + count);
+        scheduled.erase(scheduled.begin(), scheduled.begin() + count);
+        for (auto const& e : due) {
+            if (e.push) {
+                auto& h = hold(e.button, e.isPlayer1);
+                if (h.pressPending && h.pressStep == e.step) h.pressPending = false;
             }
-        }
-
-        if (fields->killPending) {
-            fields->killPending = false;
-            log::info("{}", fields->killReason);
-            if (m_player1 && !m_player1->m_isDead) {
-                notify(fields->killReason, NotificationIcon::Error);
-                this->destroyPlayer(m_player1, nullptr);
-            }
+            this->fire(e.push, e.button, e.isPlayer1);
         }
     }
 };
