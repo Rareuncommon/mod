@@ -21,6 +21,12 @@
 // death), it replaces it. A died attempt drops its last kDeathTrimSteps steps
 // of inputs, since those likely caused the death.
 //
+// The best run also stores both players' positions at every step. Snap only
+// moves an input while the player is within `path-tolerance` units of where
+// the best run was on that step. Off that path (easy to do in ship or wave,
+// where one off click changes the height), the best run's timing no longer
+// fits and inputs pass through untouched.
+//
 // Buffer and Snap only act in practice mode or when the level was started
 // from a start position (GJBaseGameLayer::m_isPracticeMode, m_isTestMode,
 // m_startPosObject); in a normal run inputs pass through untouched. Recording
@@ -96,6 +102,8 @@
 // since step counting starts over at the start position. First line
 // "# length <steps> completed <0/1>", then one event per line:
 //   <step> <button 1-3> <push 0/1> <player1 0/1>
+// and one position line per step from step 0, in order:
+//   p <player1 x> <player1 y> <player2 x> <player2 y>
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -160,6 +168,10 @@ namespace {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("buffer-frames"));
     }
 
+    float pathTolerance() {
+        return static_cast<float>(Mod::get()->getSettingValue<int64_t>("path-tolerance"));
+    }
+
     int snapWindow() {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("snap-window"));
     }
@@ -190,8 +202,13 @@ namespace {
         return Mod::get()->getSaveDir() / "references" / (name + ".txt");
     }
 
+    struct PathPoint {
+        float x1 = 0.f, y1 = 0.f, x2 = 0.f, y2 = 0.f;
+    };
+
     struct Reference {
         std::vector<RefEvent> events;
+        std::vector<PathPoint> path; // index = step
         int length = 0;          // steps the run lasted
         bool completed = false;  // the run reached the end of the level
     };
@@ -208,6 +225,12 @@ namespace {
         std::string line;
         while (std::getline(file, line)) {
             std::istringstream in(line);
+            if (line.starts_with("p ")) {
+                std::string tag;
+                PathPoint point;
+                if (in >> tag >> point.x1 >> point.y1 >> point.x2 >> point.y2) ref.path.push_back(point);
+                continue;
+            }
             if (line.starts_with("#")) {
                 std::string hash, lengthKey, completedKey;
                 int completed = 0;
@@ -229,7 +252,10 @@ namespace {
         return ref;
     }
 
-    bool saveReference(std::filesystem::path const& path, std::vector<InputEvent> const& events, int length, bool completed) {
+    bool saveReference(
+        std::filesystem::path const& path, std::vector<InputEvent> const& events,
+        std::vector<PathPoint> const& points, int length, bool completed
+    ) {
         std::error_code ec;
         std::filesystem::create_directories(path.parent_path(), ec);
         std::ofstream file(path, std::ios::trunc);
@@ -237,6 +263,9 @@ namespace {
         file << "# length " << length << " completed " << (completed ? 1 : 0) << '\n';
         for (auto const& e : events) {
             file << e.step << ' ' << e.button << ' ' << (e.push ? 1 : 0) << ' ' << (e.isPlayer1 ? 1 : 0) << '\n';
+        }
+        for (auto const& point : points) {
+            file << "p " << point.x1 << ' ' << point.y1 << ' ' << point.x2 << ' ' << point.y2 << '\n';
         }
         return static_cast<bool>(file);
     }
@@ -258,12 +287,14 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
         // Inputs the game received this attempt, for the best run.
         std::vector<InputEvent> recorded;
+        std::vector<PathPoint> path; // player positions this attempt, index = step
         bool attemptSaved = false;
 
         // Best run for the current level and start position.
         bool referenceLoaded = false;
         std::filesystem::path referenceFile;
         std::vector<RefEvent> reference;
+        std::vector<PathPoint> referencePath;
         int referenceLength = 0;
         bool referenceCompleted = false;
         std::vector<InputEvent> scheduled; // snapped inputs waiting for their step
@@ -365,19 +396,26 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
         this->ensureReference();
         int length = fields->step;
+        // A saved run without positions (from v1.5.0) can't be snapped to,
+        // so any attempt replaces it.
         Reference current;
-        current.length = fields->referenceLength;
-        current.completed = fields->referenceCompleted;
+        if (!fields->referencePath.empty()) {
+            current.length = fields->referenceLength;
+            current.completed = fields->referenceCompleted;
+        }
         if (!isBetterRun(length, completed, current)) return;
 
         std::vector<InputEvent> events = fields->recorded;
+        std::vector<PathPoint> points = fields->path;
         if (!completed) {
             int cutoff = length - kDeathTrimSteps;
             std::erase_if(events, [cutoff](auto const& e) { return e.step > cutoff; });
+            if (cutoff < 0) points.clear();
+            else if (points.size() > static_cast<size_t>(cutoff) + 1) points.resize(cutoff + 1);
         }
         if (events.empty() && !completed) return;
 
-        if (saveReference(fields->referenceFile, events, length, completed)) {
+        if (saveReference(fields->referenceFile, events, points, length, completed)) {
             log::info("Saved best run: {} steps, {} inputs, completed {}", length, events.size(), completed);
             // Loaded again on the next reset, so the current attempt is unaffected.
             fields->referenceLoaded = false;
@@ -400,12 +438,36 @@ class $modify(BufferPlayLayer, PlayLayer) {
     void onStep() {
         auto fields = m_fields.self();
         fields->step++;
+        this->recordPathPoint();
         this->stepBuffer();
         if (modEnabled() && currentMode() == Mode::Snap && this->assistAllowed()) {
             if (!fields->referenceLoaded) this->ensureReference();
             this->stepSnap();
         }
         this->updateIndicator();
+    }
+
+    PathPoint currentPoint() {
+        PathPoint point;
+        if (m_player1) {
+            point.x1 = m_player1->getPositionX();
+            point.y1 = m_player1->getPositionY();
+        }
+        if (m_player2) {
+            point.x2 = m_player2->getPositionX();
+            point.y2 = m_player2->getPositionY();
+        }
+        return point;
+    }
+
+    // Position at the start of this step, before it is processed.
+    void recordPathPoint() {
+        auto fields = m_fields.self();
+        auto point = this->currentPoint();
+        size_t index = static_cast<size_t>(fields->step);
+        if (fields->path.size() > index) fields->path.resize(index);
+        // Steps skipped (none expected) are filled with the current point.
+        while (fields->path.size() <= index) fields->path.push_back(point);
     }
 
     void clearBuffer() {
@@ -421,6 +483,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         auto fields = m_fields.self();
         int step = fields->step;
         std::erase_if(fields->recorded, [step](auto const& e) { return e.step > step; });
+        if (fields->path.size() > static_cast<size_t>(step) + 1) fields->path.resize(step + 1);
 
         fields->scheduled.clear();
         for (auto& player : fields->holds) {
@@ -567,6 +630,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
             fields->referenceFile = path;
             auto ref = loadReference(path);
             fields->reference = std::move(ref.events);
+            fields->referencePath = std::move(ref.path);
             fields->referenceLength = ref.length;
             fields->referenceCompleted = ref.completed;
             // Only the snap state is rewound here; the attempt's recording
@@ -575,6 +639,24 @@ class $modify(BufferPlayLayer, PlayLayer) {
             for (auto& r : fields->reference) r.matched = r.input.step <= step;
         }
         return !fields->reference.empty();
+    }
+
+    // Whether the players are where the best run had them on this step.
+    bool onBestRunPath(int step) {
+        auto fields = m_fields.self();
+        auto const& path = fields->referencePath;
+        if (step < 0 || static_cast<size_t>(step) >= path.size()) return false;
+
+        float tolerance = pathTolerance();
+        auto const& ref = path[step];
+        auto now = this->currentPoint();
+        auto isClose = [tolerance](float x, float y, float rx, float ry) {
+            float dx = x - rx, dy = y - ry;
+            return dx * dx + dy * dy <= tolerance * tolerance;
+        };
+        if (!isClose(now.x1, now.y1, ref.x1, ref.y1)) return false;
+        if (m_gameState.m_isDualMode && !isClose(now.x2, now.y2, ref.x2, ref.y2)) return false;
+        return true;
     }
 
     SnapHold& hold(int button, bool isPlayer1) {
@@ -626,6 +708,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
             log::debug("Snap: {} moved to step {}", buttonName(button, down), target);
             return true;
         }
+
+        if (!this->onBestRunPath(inputStep)) return false;
 
         auto ref = this->findReference(button, down, isPlayer1, inputStep, inputStep + window);
         if (!ref) return false;

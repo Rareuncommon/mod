@@ -8,7 +8,7 @@
 	},
 	"id": "yourname.input-buffer",
 	"name": "Input Buffer",
-	"version": "v1.5.0",
+	"version": "v1.6.0",
 	"developer": "yourname",
 	"description": "Practice tool for click patterns. Buffer and Snap only work in practice mode or from a start position.",
 	"settings": {
@@ -43,6 +43,14 @@
 			"default": 4,
 			"min": 0,
 			"max": 30
+		},
+		"path-tolerance": {
+			"type": "int",
+			"name": "Path Tolerance",
+			"description": "Snap mode: how far (in game units, 30 = one block) the player may be from where the best run was on the same step and still get snapped. Further off the path, clicks work as normal.",
+			"default": 10,
+			"min": 1,
+			"max": 90
 		},
 		"toggle-key": {
 			"type": "keybind",
