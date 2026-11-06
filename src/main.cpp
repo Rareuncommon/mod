@@ -63,7 +63,7 @@
 //                     bindings.
 //   m_isDead          PlayLayer::isGameplayActive() (inline) reads it.
 //
-// Buffer mode:
+// Buffer mode (wave: see "Wave lookahead" below):
 // | mode   | input type | buffered when                 | fires when            |
 // |--------|------------|-------------------------------|-----------------------|
 // | cube   | discrete   | !m_isOnGround && no ring      | m_isOnGround or ring  |
@@ -72,13 +72,46 @@
 // | spider | discrete   | !m_isOnGround && no ring      | m_isOnGround or ring  |
 // | ship   | continuous | never (pass-through)          | -                     |
 // | ufo    | continuous | never (pass-through)          | -                     |
-// | wave   | continuous | never (pass-through)          | -                     |
+// | wave   | lookahead  | path ahead crashes            | first clear step      |
 // | swing  | continuous | never (pass-through)          | -                     |
 //
 // Continuous modes are the isFlying() group. Their input does not require
-// ground contact, so the player can always act on a press and Buffer mode
-// has no state to wait for. Snap mode covers them, and every other mode,
+// ground contact, so the player can always act on a press and there is no
+// game state to wait for. Wave is handled by the lookahead below; ship, UFO
+// and swing pass through in Buffer mode. Snap mode covers every mode,
 // because it times inputs against the reference instead of the player state.
+//
+// Wave lookahead (Buffer mode, wave only): the wave has no "can act" moment,
+// a click acts the instant it happens. So instead of waiting for one, the mod
+// simulates ahead. On a press or release it predicts the wave's path for
+// `wave-lookahead` steps if the input is fired now, and if that path hits a
+// hazard or the side of a block while firing it a few steps later would not,
+// the input is held and fired on the first step whose predicted path is
+// clear, at most `buffer-frames` steps late. If firing now is clear, or no
+// step within the buffer is, the input reaches the game unchanged (late
+// inputs are never moved; a held input that runs out of steps is fired).
+//
+// The prediction is the mod's own model, not the game's physics:
+//   - x moves by the last step's measured x movement (speed portals, speed
+//     changes and teleports inside the lookahead are not seen).
+//   - y moves by that x movement times the wave slope, up while the button
+//     is held (down if upside down). The slope is measured from the last
+//     clean diagonal steps, or 1 (normal) / 2 (mini) until measured.
+//   - The hitbox is the player's own getObjectRect(), moved along the path.
+//   - Hazards (Hazard, AnimatedHazard) kill on overlap; round ones (with an
+//     object radius, like saws) use the same circle test as the game's
+//     playerIntersectsCircle. Solids (Solid, Breakable) kill on a side hit
+//     (the hitbox reaches the block from the side with the inner box,
+//     kWaveInnerScale of the hitbox, level with it) or when the inner box
+//     overlaps them; otherwise the wave slides along their top or bottom.
+//     The level floor (y = kFloorY) is slid along too.
+//   - Objects are taken where they are now: moving objects, triggers that
+//     toggle groups, slopes, orbs and portals inside the lookahead are not
+//     simulated, and neither is a ceiling.
+//   - Objects with no-touch, passable, disabled or group-disabled set are
+//     skipped.
+// A release that arrives while its press is held keeps its gap to the press
+// (the tap length), and the path is simulated with that release.
 //
 // Snap releases: a release that arrives while its press is still held back
 // is shifted by the same number of steps as the press (so the hold length is
@@ -115,6 +148,7 @@
 #include <Geode/ui/GeodeUI.hpp>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -152,6 +186,42 @@ namespace {
         bool matched = false;   // already used to snap a player input
     };
 
+    // Wave lookahead (see the header comment).
+    constexpr float kWaveInnerScale = 0.3f; // inner box used for block hits
+    constexpr float kFloorY = 90.f;          // top of the level's ground
+    constexpr float kWaveMargin = 60.f;      // extra area searched for objects
+
+    struct WaveTrack {
+        bool hasPosition = false;
+        bool hasDelta = false;
+        CCPoint last;            // position at the start of the last step
+        CCPoint delta;           // movement during the last step
+        float slope = 0.f;       // measured |dy| / |dx|, 0 = not measured
+        float size = 0.f;        // m_vehicleSize the slope was measured at
+    };
+
+    struct WavePending {
+        bool active = false;
+        bool push = false;       // the held input is a press (else a release)
+        int arrivedStep = 0;     // step the input arrived on
+        int waited = 0;          // steps it has been held
+        bool hasFollow = false;  // the opposite input arrived while held
+        int followGap = 0;       // steps between the two inputs
+    };
+
+    struct WaveFollow {
+        bool active = false;
+        bool push = false;
+        int step = 0;            // step to fire on
+    };
+
+    struct WaveObstacle {
+        CCRect rect;
+        CCPoint center;          // for round hazards
+        float radius = 0.f;      // > 0: round hazard
+        bool hazard = false;     // else solid
+    };
+
     struct SnapHold {
         bool pressPending = false; // a snapped press has not fired yet
         int pressStep = 0;         // step the snapped press fires on
@@ -166,6 +236,10 @@ namespace {
 
     bool modEnabled() {
         return Mod::get()->getSettingValue<bool>("enabled");
+    }
+
+    int waveLookahead() {
+        return static_cast<int>(Mod::get()->getSettingValue<int64_t>("wave-lookahead"));
     }
 
     int bufferFrames() {
@@ -322,6 +396,12 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
         bool inStep = false;     // inside GJBaseGameLayer::processCommands
 
+        // Wave lookahead, indexed like slots (by input channel / player).
+        WaveTrack waveTracks[2];   // [0] = m_player2, [1] = m_player1
+        WavePending wave[2];
+        WaveFollow waveFollow[2];
+        bool jumpHeld[2] = {};     // jump state the game has seen per input
+
         CCLabelBMFont* indicator = nullptr;
         std::string indicatorText;
         std::string lastClick;   // what happened to the last press
@@ -361,6 +441,9 @@ class $modify(BufferPlayLayer, PlayLayer) {
             case Mode::Buffer:
                 if (this->assistAllowed() && bufferFrames() > 0) {
                     text = fmt::format("Input Buffer: {} steps", bufferFrames());
+                    if (m_player1 && m_player1->m_isDart) {
+                        text += fmt::format(", wave lookahead {}", waveLookahead());
+                    }
                 }
                 break;
             case Mode::Snap:
@@ -470,7 +553,9 @@ class $modify(BufferPlayLayer, PlayLayer) {
         auto fields = m_fields.self();
         fields->step++;
         this->recordPathPoint();
+        this->updateWaveTracks();
         this->stepBuffer();
+        this->stepWave();
         if (modEnabled() && currentMode() == Mode::Snap && this->assistAllowed()) {
             if (!fields->referenceLoaded) this->ensureReference();
             this->stepSnap();
@@ -506,6 +591,14 @@ class $modify(BufferPlayLayer, PlayLayer) {
         for (auto& player : fields->slots) {
             for (auto& slot : player) slot = {};
         }
+        for (auto& w : fields->wave) w = {};
+        for (auto& f : fields->waveFollow) f = {};
+    }
+
+    // Positions jump on a reset or checkpoint respawn, so the next speed
+    // reading has to start over.
+    void resetWaveTracks() {
+        for (auto& t : m_fields->waveTracks) t = {};
     }
 
     // Puts every per-attempt state back to fields->step, which is 0 after a
@@ -533,6 +626,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         // A checkpoint respawn sets fields->step in loadFromCheckpoint.
         this->clearBuffer();
         fields->attemptSaved = false;
+        this->resetWaveTracks();
         // The start position may have changed, which selects another best run.
         this->ensureReference();
         this->rewindToStep();
@@ -558,6 +652,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
         auto fields = m_fields.self();
         auto it = fields->checkpointSteps.find(checkpoint);
         if (it != fields->checkpointSteps.end()) fields->step = it->second;
+        this->clearBuffer();
+        this->resetWaveTracks();
     }
 
     void removeAllCheckpoints() {
@@ -595,6 +691,11 @@ class $modify(BufferPlayLayer, PlayLayer) {
     }
 
     bool onBufferButton(bool down, int button, bool isPlayer1) {
+        // A press held from another mode is finished by the normal buffer.
+        if (button == static_cast<int>(PlayerButton::Jump) && !slot(button, isPlayer1).pending
+            && this->inputIsWave(isPlayer1)) {
+            return this->onWaveButton(down, isPlayer1);
+        }
         auto& s = slot(button, isPlayer1);
         if (!down) {
             if (s.pending) {
@@ -609,7 +710,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         if (button != static_cast<int>(PlayerButton::Jump)) return false;
         auto player = isPlayer1 || !m_player2 ? m_player1 : m_player2;
         if (inputIsContinuous(isPlayer1)) {
-            this->report(fmt::format("{}: Buffer does nothing in this mode, use Snap", gamemodeName(player)));
+            this->report(fmt::format("{}: Buffer does nothing in this mode (wave only), use Snap", gamemodeName(player)));
             return false;
         }
         if (inputCanAct(isPlayer1)) {
@@ -662,6 +763,314 @@ class $modify(BufferPlayLayer, PlayLayer) {
                 this->report(released
                     ? "buffer ran out before landing, tap dropped"
                     : "buffer ran out before landing, held click passed on");
+            }
+        }
+    }
+
+    // ---- Buffer mode: wave lookahead ----
+
+    // Every jump input that reaches the game, so the mod knows whether the
+    // game currently sees the button held.
+    void noteInput(bool down, int button, bool isPlayer1) {
+        if (button != static_cast<int>(PlayerButton::Jump)) return;
+        m_fields->jumpHeld[isPlayer1 ? 1 : 0] = down;
+    }
+
+    // The players a jump input on this channel moves.
+    std::vector<PlayerObject*> inputPlayers(bool isPlayer1) {
+        std::vector<PlayerObject*> players;
+        bool twoPlayer = m_levelSettings && m_levelSettings->m_twoPlayerMode;
+        if (twoPlayer) {
+            auto player = isPlayer1 ? m_player1 : m_player2;
+            if (player) players.push_back(player);
+            return players;
+        }
+        if (m_player1) players.push_back(m_player1);
+        if (m_gameState.m_isDualMode && m_player2) players.push_back(m_player2);
+        return players;
+    }
+
+    static bool isSimulatableWave(PlayerObject* player) {
+        return player && player->m_isDart && !player->m_isDead
+            && !player->m_isPlatformer && !player->m_isSideways;
+    }
+
+    bool inputIsWave(bool isPlayer1) {
+        auto players = this->inputPlayers(isPlayer1);
+        if (players.empty()) return false;
+        return std::all_of(players.begin(), players.end(), isSimulatableWave);
+    }
+
+    WaveTrack& waveTrack(PlayerObject* player) {
+        return m_fields->waveTracks[player == m_player2 ? 0 : 1];
+    }
+
+    // Measures each player's movement over the step that just ended.
+    void updateWaveTracks() {
+        for (auto player : { m_player1, m_player2 }) {
+            if (!player) continue;
+            auto& t = this->waveTrack(player);
+            auto pos = player->getPosition();
+            // Mini and normal wave have different slopes.
+            if (t.size != player->m_vehicleSize) {
+                t.slope = 0.f;
+                t.size = player->m_vehicleSize;
+            }
+            if (t.hasPosition) {
+                auto delta = pos - t.last;
+                // Slope from a clean diagonal step: moving, and going the
+                // same way up or down as the step before (not a turn).
+                if (t.hasDelta && std::abs(delta.x) > 0.01f && std::abs(delta.y) > 0.01f
+                    && (delta.y > 0.f) == (t.delta.y > 0.f)) {
+                    float slope = std::abs(delta.y) / std::abs(delta.x);
+                    if (slope > 0.3f && slope < 3.f) t.slope = slope;
+                }
+                t.delta = delta;
+                t.hasDelta = true;
+            }
+            t.last = pos;
+            t.hasPosition = true;
+        }
+    }
+
+    float waveSlope(PlayerObject* player) {
+        auto const& t = this->waveTrack(player);
+        if (t.slope > 0.f) return t.slope;
+        return player->m_vehicleSize < 1.f ? 2.f : 1.f;
+    }
+
+    // Solids and hazards around the players that the next `steps` steps
+    // could reach.
+    std::vector<WaveObstacle> gatherObstacles(std::vector<PlayerObject*> const& players, int steps) {
+        std::vector<WaveObstacle> obstacles;
+        if (!m_objects || players.empty()) return obstacles;
+
+        float minX = FLT_MAX, maxX = -FLT_MAX, minY = FLT_MAX, maxY = -FLT_MAX;
+        for (auto player : players) {
+            auto const& t = this->waveTrack(player);
+            auto pos = player->getPosition();
+            float reachX = std::abs(t.delta.x) * steps;
+            float reachY = reachX * this->waveSlope(player);
+            minX = std::min(minX, pos.x - reachX);
+            maxX = std::max(maxX, pos.x + reachX);
+            minY = std::min(minY, pos.y - reachY);
+            maxY = std::max(maxY, pos.y + reachY);
+        }
+        CCRect area(minX - kWaveMargin, minY - kWaveMargin,
+            maxX - minX + 2 * kWaveMargin, maxY - minY + 2 * kWaveMargin);
+
+        for (auto object : CCArrayExt<GameObject*>(m_objects)) {
+            if (!object) continue;
+            auto type = object->m_objectType;
+            bool hazard = type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard;
+            bool solid = type == GameObjectType::Solid || type == GameObjectType::Breakable;
+            if (!hazard && !solid) continue;
+            if (object->m_isNoTouch || object->m_isPassable) continue;
+            if (object->m_isDisabled || object->m_isGroupDisabled) continue;
+
+            WaveObstacle o;
+            o.hazard = hazard;
+            o.rect = object->getObjectRect();
+            if (hazard && object->m_objectRadius > 0.f) {
+                o.radius = object->getObjectRadius();
+                o.center = object->getPosition();
+                o.rect = CCRect(o.center.x - o.radius, o.center.y - o.radius, o.radius * 2, o.radius * 2);
+            }
+            if (o.rect.size.width <= 0.f || o.rect.size.height <= 0.f) continue;
+            if (!o.rect.intersectsRect(area)) continue;
+            obstacles.push_back(o);
+        }
+        return obstacles;
+    }
+
+    // Simulates one player for `steps` steps. The button is `heldBefore`
+    // until step `switchAt`, then the other way; with `switchBackAt` >= 0 it
+    // goes back to `heldBefore` on that step. Returns the number of steps
+    // survived (== steps if the path is clear).
+    int simulateWave(
+        PlayerObject* player, std::vector<WaveObstacle> const& obstacles,
+        bool heldBefore, int switchAt, int switchBackAt, int steps
+    ) {
+        auto const& t = this->waveTrack(player);
+        float dx = t.delta.x;
+        float dy = std::abs(dx) * this->waveSlope(player);
+
+        auto pos = player->getPosition();
+        auto box = player->getObjectRect();
+        CCPoint offset = ccp(box.getMidX() - pos.x, box.getMidY() - pos.y);
+        float halfW = box.size.width / 2, halfH = box.size.height / 2;
+        float innerW = halfW * kWaveInnerScale, innerH = halfH * kWaveInnerScale;
+        CCPoint center = pos + offset;
+
+        for (int i = 0; i < steps; ++i) {
+            bool held = heldBefore;
+            if (i >= switchAt) held = !heldBefore;
+            if (switchBackAt >= 0 && i >= switchBackAt) held = heldBefore;
+            bool up = held != player->m_isUpsideDown;
+            float moveY = up ? dy : -dy;
+
+            float prevX = center.x;
+            center.x += dx;
+            center.y += moveY;
+
+            // Blocks: running into a side, or the inner box overlapping,
+            // kills; touching a top or bottom slides along it.
+            for (auto const& o : obstacles) {
+                if (o.hazard) continue;
+                CCRect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
+                if (!outer.intersectsRect(o.rect)) continue;
+                bool wasAbove = prevX + halfW > o.rect.getMinX() && prevX - halfW < o.rect.getMaxX();
+                bool innerInY = center.y + innerH > o.rect.getMinY() && center.y - innerH < o.rect.getMaxY();
+                if (!wasAbove && innerInY) return i;
+                CCRect inner(center.x - innerW, center.y - innerH, innerW * 2, innerH * 2);
+                if (inner.intersectsRect(o.rect)) return i;
+                if (center.y < o.rect.getMidY()) center.y = std::min(center.y, o.rect.getMinY() - halfH);
+                else center.y = std::max(center.y, o.rect.getMaxY() + halfH);
+            }
+            center.y = std::max(center.y, kFloorY + halfH);
+
+            CCRect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
+            for (auto const& o : obstacles) {
+                if (!o.hazard) continue;
+                if (o.radius > 0.f) {
+                    if (ccpDistance(o.center, center) <= halfW + o.radius) return i;
+                }
+                else if (outer.intersectsRect(o.rect)) return i;
+            }
+        }
+        return steps;
+    }
+
+    // Earliest delay (0..maxDelay) at which firing the input gives every
+    // player a clear path, or -1 if none does.
+    int findClearDelay(bool isPlayer1, bool push, int maxDelay, int followGap) {
+        auto players = this->inputPlayers(isPlayer1);
+        int lookahead = waveLookahead();
+        auto obstacles = this->gatherObstacles(players, lookahead + maxDelay);
+        bool heldBefore = !push;
+        for (int delay = 0; delay <= maxDelay; ++delay) {
+            int steps = lookahead + delay;
+            int switchBack = followGap > 0 ? delay + followGap : -1;
+            bool clear = std::all_of(players.begin(), players.end(), [&](PlayerObject* player) {
+                return this->simulateWave(player, obstacles, heldBefore, delay, switchBack, steps) >= steps;
+            });
+            if (clear) return delay;
+        }
+        return -1;
+    }
+
+    bool waveTracksReady(bool isPlayer1) {
+        auto players = this->inputPlayers(isPlayer1);
+        return std::all_of(players.begin(), players.end(), [&](PlayerObject* player) {
+            auto const& t = this->waveTrack(player);
+            return t.hasDelta && std::abs(t.delta.x) > 0.01f;
+        });
+    }
+
+    // Fires a held wave input now, and schedules its release if one came in.
+    void fireWave(bool isPlayer1) {
+        auto fields = m_fields.self();
+        int ch = isPlayer1 ? 1 : 0;
+        auto w = fields->wave[ch];
+        fields->wave[ch] = {};
+        if (!w.active) return;
+        this->fire(w.push, static_cast<int>(PlayerButton::Jump), isPlayer1);
+        if (w.hasFollow) {
+            fields->waveFollow[ch] = { true, !w.push, fields->step + w.followGap };
+        }
+    }
+
+    void fireWaveFollow(bool isPlayer1) {
+        auto fields = m_fields.self();
+        auto& f = fields->waveFollow[isPlayer1 ? 1 : 0];
+        if (!f.active) return;
+        bool push = f.push;
+        f = {};
+        this->fire(push, static_cast<int>(PlayerButton::Jump), isPlayer1);
+    }
+
+    bool onWaveButton(bool down, bool isPlayer1) {
+        auto fields = m_fields.self();
+        int ch = isPlayer1 ? 1 : 0;
+        auto& w = fields->wave[ch];
+        char const* what = down ? "click" : "release";
+
+        if (w.active) {
+            // The opposite input while one is held: keep the gap between them.
+            if (down != w.push && !w.hasFollow) {
+                w.hasFollow = true;
+                w.followGap = std::max(1, this->inputStep() - w.arrivedStep);
+                return true;
+            }
+            // Anything more: fire what is held and pass this one through.
+            this->fireWave(isPlayer1);
+            this->fireWaveFollow(isPlayer1);
+            this->report(fmt::format("wave: another input came in, held input fired"));
+            return false;
+        }
+        // A scheduled release must reach the game before a new input.
+        this->fireWaveFollow(isPlayer1);
+
+        // Not a change of direction (e.g. a repeat): nothing to time.
+        if (fields->jumpHeld[ch] == down) return false;
+
+        int frames = bufferFrames();
+        if (frames <= 0) return false;
+        if (!this->waveTracksReady(isPlayer1)) {
+            this->report(fmt::format("wave: no speed reading yet, {} passed through", what));
+            return false;
+        }
+
+        int delay = this->findClearDelay(isPlayer1, down, frames, 0);
+        if (delay == 0) {
+            this->report(fmt::format("wave: path clear, {} passed through", what));
+            return false;
+        }
+        if (delay < 0) {
+            this->report(fmt::format(
+                "wave: {} crashes and so does every step in the next {}, passed through", what, frames
+            ));
+            return false;
+        }
+
+        w = {};
+        w.active = true;
+        w.push = down;
+        w.arrivedStep = this->inputStep();
+        this->report(fmt::format("wave: {} now crashes, holding (clear in {} steps)", what, delay));
+        return true;
+    }
+
+    // Each step: fire scheduled releases and held inputs whose path is clear.
+    void stepWave() {
+        auto fields = m_fields.self();
+        bool active = modEnabled() && currentMode() == Mode::Buffer && this->assistAllowed();
+        for (int ch = 0; ch < 2; ++ch) {
+            bool isPlayer1 = ch == 1;
+            auto& f = fields->waveFollow[ch];
+            if (f.active && f.step <= fields->step) this->fireWaveFollow(isPlayer1);
+
+            auto& w = fields->wave[ch];
+            if (!w.active) continue;
+            w.waited++;
+            int waited = w.waited;
+            char const* what = w.push ? "click" : "release";
+
+            if (!active || !this->inputIsWave(isPlayer1)) {
+                this->fireWave(isPlayer1);
+                this->report(fmt::format("wave: left wave or turned off, {} fired {} steps late", what, waited));
+                continue;
+            }
+            int remaining = std::max(0, bufferFrames() - waited);
+            int followGap = w.hasFollow ? w.followGap : 0;
+            int delay = this->findClearDelay(isPlayer1, w.push, remaining, followGap);
+            if (delay == 0) {
+                this->fireWave(isPlayer1);
+                this->report(fmt::format("wave: path clear, {} fired {} steps late", what, waited));
+            }
+            else if (delay < 0) {
+                this->fireWave(isPlayer1);
+                this->report(fmt::format("wave: no clear step left, {} fired {} steps late", what, waited));
             }
         }
     }
@@ -845,6 +1254,7 @@ class $modify(BufferGameLayer, GJBaseGameLayer) {
         auto pl = this->bufferLayer();
         if (pl) {
             if (pl->onButton(down, button, isPlayer1)) return;
+            pl->noteInput(down, button, isPlayer1);
             pl->recordInput(down, button, isPlayer1);
         }
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
