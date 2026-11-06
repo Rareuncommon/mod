@@ -38,6 +38,9 @@
 // mode). They only respond inside a practice or start position run. The
 // pause menu gets a button that opens the mod's settings.
 //
+// Click info: with `show-click-info` on, the label's second line says what
+// the mod did with the last press and why; every decision is also logged.
+//
 // Bindings: geode-sdk/bindings, bindings/2.2081/GeometryDash.bro (Geode SDK 5.11.2).
 // "Inline" = the function body is in bindings/2.2081/inline/*.cpp.
 //
@@ -134,6 +137,7 @@ namespace {
         bool releasePending = false; // the button was released while held back
         bool releaseNextStep = false;// replay the release on the next step
         int framesLeft = 0;
+        int waited = 0;              // steps the press has been held back
     };
 
     struct InputEvent {
@@ -166,6 +170,22 @@ namespace {
 
     int bufferFrames() {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("buffer-frames"));
+    }
+
+    bool showClickInfo() {
+        return Mod::get()->getSettingValue<bool>("show-click-info");
+    }
+
+    char const* gamemodeName(PlayerObject* player) {
+        if (!player) return "?";
+        if (player->m_isShip) return "ship";
+        if (player->m_isBird) return "UFO";
+        if (player->m_isDart) return "wave";
+        if (player->m_isSwing) return "swing";
+        if (player->m_isBall) return "ball";
+        if (player->m_isRobot) return "robot";
+        if (player->m_isSpider) return "spider";
+        return "cube";
     }
 
     float pathTolerance() {
@@ -304,6 +324,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
         CCLabelBMFont* indicator = nullptr;
         std::string indicatorText;
+        std::string lastClick;   // what happened to the last press
     };
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -350,10 +371,20 @@ class $modify(BufferPlayLayer, PlayLayer) {
                 }
                 break;
         }
+        if (!text.empty() && showClickInfo() && !fields->lastClick.empty()) {
+            text += "\n" + fields->lastClick;
+        }
         if (text == fields->indicatorText) return;
         fields->indicatorText = text;
         fields->indicator->setString(text.c_str());
         fields->indicator->setVisible(!text.empty());
+    }
+
+    void report(std::string text) {
+        auto fields = m_fields.self();
+        log::info("Step {}: {}", fields->step, text);
+        fields->lastClick = std::move(text);
+        this->updateIndicator();
     }
 
     void fire(bool down, int button, bool isPlayer1) {
@@ -576,14 +607,23 @@ class $modify(BufferPlayLayer, PlayLayer) {
         int frames = bufferFrames();
         if (frames <= 0) return false;
         if (button != static_cast<int>(PlayerButton::Jump)) return false;
-        if (inputIsContinuous(isPlayer1)) return false;
-        if (inputCanAct(isPlayer1)) return false;
+        auto player = isPlayer1 || !m_player2 ? m_player1 : m_player2;
+        if (inputIsContinuous(isPlayer1)) {
+            this->report(fmt::format("{}: Buffer does nothing in this mode, use Snap", gamemodeName(player)));
+            return false;
+        }
+        if (inputCanAct(isPlayer1)) {
+            this->report(fmt::format("{}: could already jump, passed through", gamemodeName(player)));
+            return false;
+        }
 
         if (s.releaseNextStep) this->fire(false, button, isPlayer1);
         s.pending = true;
         s.releasePending = false;
         s.releaseNextStep = false;
         s.framesLeft = frames;
+        s.waited = 0;
+        this->report(fmt::format("{}: in the air, holding click (up to {} steps)", gamemodeName(player), frames));
         return true;
     }
 
@@ -599,11 +639,14 @@ class $modify(BufferPlayLayer, PlayLayer) {
                     continue;
                 }
                 if (!s.pending) continue;
+                s.waited++;
 
                 if (inputCanAct(isPlayer1)) {
                     bool released = s.releasePending;
+                    int waited = s.waited;
                     s = {};
                     this->fire(true, b, isPlayer1);
+                    this->report(fmt::format("landed, click fired {} steps late", waited));
                     // Release one step later so the press is seen for a step.
                     if (released) s.releaseNextStep = true;
                     continue;
@@ -616,6 +659,9 @@ class $modify(BufferPlayLayer, PlayLayer) {
                 bool released = s.releasePending;
                 s = {};
                 if (!released) this->fire(true, b, isPlayer1);
+                this->report(released
+                    ? "buffer ran out before landing, tap dropped"
+                    : "buffer ran out before landing, held click passed on");
             }
         }
     }
@@ -641,22 +687,39 @@ class $modify(BufferPlayLayer, PlayLayer) {
         return !fields->reference.empty();
     }
 
-    // Whether the players are where the best run had them on this step.
-    bool onBestRunPath(int step) {
+    // How far the players are from where the best run had them on this
+    // step, or -1 if the best run doesn't reach this step.
+    float distanceFromBestRun(int step) {
         auto fields = m_fields.self();
         auto const& path = fields->referencePath;
-        if (step < 0 || static_cast<size_t>(step) >= path.size()) return false;
+        if (step < 0 || static_cast<size_t>(step) >= path.size()) return -1.f;
 
-        float tolerance = pathTolerance();
         auto const& ref = path[step];
         auto now = this->currentPoint();
-        auto isClose = [tolerance](float x, float y, float rx, float ry) {
-            float dx = x - rx, dy = y - ry;
-            return dx * dx + dy * dy <= tolerance * tolerance;
-        };
-        if (!isClose(now.x1, now.y1, ref.x1, ref.y1)) return false;
-        if (m_gameState.m_isDualMode && !isClose(now.x2, now.y2, ref.x2, ref.y2)) return false;
-        return true;
+        float distance = std::hypot(now.x1 - ref.x1, now.y1 - ref.y1);
+        if (m_gameState.m_isDualMode) distance = std::max(distance, std::hypot(now.x2 - ref.x2, now.y2 - ref.y2));
+        return distance;
+    }
+
+    // Describes why a press got no best-run click inside the window.
+    std::string describeNoMatch(int button, bool isPlayer1, int inputStep, int window) {
+        constexpr int kSearch = 120;
+        RefEvent const* nearest = nullptr;
+        for (auto const& ref : m_fields->reference) {
+            if (ref.input.step > inputStep + kSearch) break;
+            if (ref.input.step < inputStep - kSearch) continue;
+            if (ref.input.button != button || !ref.input.push || ref.input.isPlayer1 != isPlayer1) continue;
+            if (!nearest || std::abs(ref.input.step - inputStep) < std::abs(nearest->input.step - inputStep)) {
+                nearest = &ref;
+            }
+        }
+        if (!nearest) return "no best-run click near here, passed through";
+        int offset = nearest->input.step - inputStep;
+        if (offset > 0) {
+            return fmt::format("best run clicked {} steps later (window {}), passed through", offset, window);
+        }
+        if (offset == 0) return "best-run click here was already used, passed through";
+        return fmt::format("{} steps after the best run's click, too late to move", -offset);
     }
 
     SnapHold& hold(int button, bool isPlayer1) {
@@ -688,7 +751,10 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
     bool onSnapButton(bool down, int button, bool isPlayer1) {
         // Without a reference, inputs pass through untouched.
-        if (!this->ensureReference()) return false;
+        if (!this->ensureReference()) {
+            if (down) this->report("no best run here yet, play this part once first");
+            return false;
+        }
 
         int window = snapWindow();
         int inputStep = this->inputStep();
@@ -709,14 +775,34 @@ class $modify(BufferPlayLayer, PlayLayer) {
             return true;
         }
 
-        if (!this->onBestRunPath(inputStep)) return false;
+        auto mode = gamemodeName(m_player1);
+        float distance = this->distanceFromBestRun(inputStep);
+        if (distance < 0.f) {
+            if (down) this->report(fmt::format("{}: past the end of your best run, passed through", mode));
+            return false;
+        }
+        if (distance > pathTolerance()) {
+            if (down) {
+                this->report(fmt::format(
+                    "{}: {:.0f} units off your best run's path (tolerance {:.0f}), passed through",
+                    mode, distance, pathTolerance()
+                ));
+            }
+            return false;
+        }
 
         auto ref = this->findReference(button, down, isPlayer1, inputStep, inputStep + window);
-        if (!ref) return false;
+        if (!ref) {
+            if (down) this->report(fmt::format("{}: {}", mode, this->describeNoMatch(button, isPlayer1, inputStep, window)));
+            return false;
+        }
 
         ref->matched = true;
         int target = ref->input.step;
-        if (target == inputStep) return false;
+        if (target == inputStep) {
+            if (down) this->report(fmt::format("{}: on time", mode));
+            return false;
+        }
 
         this->schedule(target, button, down, isPlayer1);
         if (down) {
@@ -724,7 +810,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
             h.pressStep = target;
             h.shift = target - inputStep;
         }
-        log::debug("Snap: {} {} steps early, moved to step {}", buttonName(button, down), target - inputStep, target);
+        if (down) this->report(fmt::format("{}: {} steps early, moved onto the best run's click", mode, target - inputStep));
+        else log::info("Step {}: release {} steps early, moved", m_fields->step, target - inputStep);
         return true;
     }
 

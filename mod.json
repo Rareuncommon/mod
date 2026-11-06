@@ -8,7 +8,7 @@
 	},
 	"id": "yourname.input-buffer",
 	"name": "Input Buffer",
-	"version": "v1.6.0",
+	"version": "v1.6.1",
 	"developer": "yourname",
 	"description": "Practice tool for click patterns. Buffer and Snap only work in practice mode or from a start position.",
 	"settings": {
@@ -51,6 +51,12 @@
 			"default": 10,
 			"min": 1,
 			"max": 90
+		},
+		"show-click-info": {
+			"type": "bool",
+			"name": "Show Click Info",
+			"description": "Show what the mod did with your last click, and why, under the corner label. Every decision is also written to the Geode log.",
+			"default": true
 		},
 		"toggle-key": {
 			"type": "keybind",
