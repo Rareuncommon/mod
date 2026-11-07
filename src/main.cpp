@@ -108,8 +108,14 @@
 //     the inner box (kWaveInnerScale of the hitbox) overlaps kills, which is
 //     a side or head-on hit.
 //     The level floor (y = kFloorY) is slid along too.
+//   - Slopes (Slope) are the line from slopeYPos() at the left and right of
+//     their rect, solid below it (slopeFloorTop()) or above it. The wave
+//     slides along one it moves parallel to, or lands on one that is flat or
+//     falls away in its direction (like a floor or ceiling); running into a
+//     slope's rising face kills once the inner box is past the line, and a
+//     slope with m_slopeIsHazard kills on touch.
 //   - Objects are taken where they are now: moving objects, triggers that
-//     toggle groups, slopes, orbs and portals inside the lookahead are not
+//     toggle groups, orbs and portals inside the lookahead are not
 //     simulated, and neither is a ceiling.
 //   - Objects with no-touch, passable, disabled or group-disabled set are
 //     skipped.
@@ -223,6 +229,17 @@ namespace {
         CCPoint center;          // for round hazards
         float radius = 0.f;      // > 0: round hazard
         bool hazard = false;     // else solid
+        bool slope = false;      // a slope: solid on one side of a line
+        bool floorTop = false;   // slope: solid below the line (else above)
+        bool deadly = false;     // slope: kills on touch
+        float y0 = 0.f, y1 = 0.f;// slope: line height at rect min x / max x
+
+        float surfaceAt(float x) const {
+            float w = rect.size.width;
+            if (w <= 0.f) return y0;
+            float t = std::clamp((x - rect.getMinX()) / w, 0.f, 1.f);
+            return y0 + (y1 - y0) * t;
+        }
     };
 
     struct SnapHold {
@@ -880,7 +897,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
             auto type = object->m_objectType;
             bool hazard = type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard;
             bool solid = type == GameObjectType::Solid || type == GameObjectType::Breakable;
-            if (!hazard && !solid) continue;
+            bool slope = type == GameObjectType::Slope;
+            if (!hazard && !solid && !slope) continue;
             if (object->m_isNoTouch || object->m_isPassable) continue;
             if (object->m_isDisabled || object->m_isGroupDisabled) continue;
 
@@ -894,6 +912,13 @@ class $modify(BufferPlayLayer, PlayLayer) {
             }
             if (o.rect.size.width <= 0.f || o.rect.size.height <= 0.f) continue;
             if (!o.rect.intersectsRect(area)) continue;
+            if (slope) {
+                o.slope = true;
+                o.floorTop = object->slopeFloorTop();
+                o.deadly = object->m_slopeIsHazard;
+                o.y0 = static_cast<float>(object->slopeYPos(o.rect.getMinX()));
+                o.y1 = static_cast<float>(object->slopeYPos(o.rect.getMaxX()));
+            }
             obstacles.push_back(o);
         }
         return obstacles;
@@ -947,7 +972,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
             // Blocks the wave was already level with in x: it moved onto
             // their top or bottom, so it slides along them.
             for (auto const& o : obstacles) {
-                if (o.hazard) continue;
+                if (o.hazard || o.slope) continue;
                 bool wasOver = prevX + halfW > o.rect.getMinX() && prevX - halfW < o.rect.getMaxX();
                 if (!wasOver) continue;
                 CCRect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
@@ -962,8 +987,46 @@ class $modify(BufferPlayLayer, PlayLayer) {
             // level with them, a corner graze otherwise.
             CCRect inner(center.x - innerW, center.y - innerH, innerW * 2, innerH * 2);
             for (auto const& o : obstacles) {
-                if (o.hazard) continue;
+                if (o.hazard || o.slope) continue;
                 if (inner.intersectsRect(o.rect)) return { i, "a block" };
+            }
+
+            // Slopes: the wave slides along one it moves parallel to, or one
+            // it lands on that is flat or falling away in its direction (like
+            // the floor). Running into the rising face crashes once the inner
+            // box is in; touching a hazard slope crashes.
+            {
+                float waveRise = (up ? dy : -dy) / std::max(std::abs(dx), 0.001f);
+                float dir = dx < 0.f ? -1.f : 1.f;
+                for (auto const& o : obstacles) {
+                    if (!o.slope) continue;
+                    CCRect box(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
+                    if (!box.intersectsRect(o.rect)) continue;
+                    float left = center.x - halfW, right = center.x + halfW;
+                    // Surface rise per unit moved in the wave's direction.
+                    float rise = (o.y1 - o.y0) / o.rect.size.width * dir;
+                    bool parallel = std::abs(waveRise - rise) < 0.2f;
+                    if (o.floorTop) {
+                        float surface = std::max(o.surfaceAt(left), o.surfaceAt(right));
+                        if (center.y - halfH >= surface) continue;
+                        if (o.deadly) return { i, "a hazard slope" };
+                        if (parallel || rise <= 0.05f) {
+                            center.y = surface + halfH;
+                            continue;
+                        }
+                        if (center.y - innerH < surface) return { i, "a slope" };
+                    }
+                    else {
+                        float surface = std::min(o.surfaceAt(left), o.surfaceAt(right));
+                        if (center.y + halfH <= surface) continue;
+                        if (o.deadly) return { i, "a hazard slope" };
+                        if (parallel || rise >= -0.05f) {
+                            center.y = surface - halfH;
+                            continue;
+                        }
+                        if (center.y + innerH > surface) return { i, "a slope" };
+                    }
+                }
             }
 
             CCRect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
@@ -1061,7 +1124,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
     // Draws what the prediction saw: the hitbox, the path if the input
     // fires now (red if it crashes, green if not), the path at the chosen
     // delay (yellow), and the obstacles it checked (hazards orange, blocks
-    // blue).
+    // and slope surfaces cyan).
     void drawWaveChoice(
         std::vector<PlayerObject*> const& players, std::vector<WaveObstacle> const& obstacles,
         bool held, int followGap, WaveChoice const& choice
@@ -1071,9 +1134,15 @@ class $modify(BufferPlayLayer, PlayLayer) {
         draw->clear();
 
         ccColor4F none { 0.f, 0.f, 0.f, 0.f };
+        ccColor4F hazardColor { 1.f, .55f, 0.f, 1.f };   // orange
+        ccColor4F solidColor { 0.f, 1.f, 1.f, 1.f };     // cyan
         for (auto const& o : obstacles) {
-            ccColor4F color = o.hazard ? ccColor4F { 1.f, .5f, 0.f, 1.f } : ccColor4F { .2f, .5f, 1.f, 1.f };
-            if (o.radius > 0.f) {
+            ccColor4F color = o.hazard || o.deadly ? hazardColor : solidColor;
+            if (o.slope) {
+                // The slope's surface line, which is what the wave collides with.
+                draw->drawSegment(ccp(o.rect.getMinX(), o.y0), ccp(o.rect.getMaxX(), o.y1), 1.25f, color);
+            }
+            else if (o.radius > 0.f) {
                 draw->drawCircle(o.center, o.radius, none, 1.f, color, 24);
             }
             else {
