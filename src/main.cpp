@@ -83,27 +83,30 @@
 //
 // Wave lookahead (Buffer mode, wave only): the wave has no "can act" moment,
 // a click acts the instant it happens. So instead of waiting for one, the mod
-// simulates ahead. On a press or release it predicts the wave's path for
-// `wave-lookahead` steps if the input is fired now, and if that path hits a
-// hazard or the side of a block while firing it a few steps later would not,
-// the input is held and fired on the first step whose predicted path is
-// clear, at most `buffer-frames` steps late. If firing now is clear, or no
-// step within the buffer is, the input reaches the game unchanged (late
-// inputs are never moved; a held input that runs out of steps is fired).
+// simulates ahead. On a press or release it predicts, for every delay from 0
+// to `buffer-frames` steps, how many steps the wave survives after the input
+// fires (up to `wave-lookahead`). The button is assumed to stay that way
+// after the input, so in a tight part every choice crashes eventually; that
+// crash moves along with the delay and is not a reason to wait. The input is
+// only held when some delay survives clearly longer (kMinGain steps) than
+// firing now, and it is then fired at the best delay, re-checked every step.
+// Otherwise it reaches the game unchanged. Late inputs are never moved, and
+// a held input is always fired, never dropped.
 //
 // The prediction is the mod's own model, not the game's physics:
 //   - x moves by the last step's measured x movement (speed portals, speed
 //     changes and teleports inside the lookahead are not seen).
-//   - y moves by that x movement times the wave slope, up while the button
-//     is held (down if upside down). The slope is measured from the last
-//     clean diagonal steps, or 1 (normal) / 2 (mini) until measured.
+//   - y moves by that x movement times the wave slope. The direction before
+//     the input is the one the wave moved in last step (from the button and
+//     gravity while sliding); the input turns it. The slope is measured from
+//     the last clean diagonal steps, or 1 (normal) / 2 (mini) until measured.
 //   - The hitbox is the player's own getObjectRect(), moved along the path.
 //   - Hazards (Hazard, AnimatedHazard) kill on overlap; round ones (with an
 //     object radius, like saws) use the same circle test as the game's
-//     playerIntersectsCircle. Solids (Solid, Breakable) kill on a side hit
-//     (the hitbox reaches the block from the side with the inner box,
-//     kWaveInnerScale of the hitbox, level with it) or when the inner box
-//     overlaps them; otherwise the wave slides along their top or bottom.
+//     playerIntersectsCircle. Solids (Solid, Breakable) the wave was already
+//     level with in x are slid along (top or bottom); after that, any solid
+//     the inner box (kWaveInnerScale of the hitbox) overlaps kills, which is
+//     a side or head-on hit.
 //     The level floor (y = kFloorY) is slid along too.
 //   - Objects are taken where they are now: moving objects, triggers that
 //     toggle groups, slopes, orbs and portals inside the lookahead are not
@@ -883,13 +886,26 @@ class $modify(BufferPlayLayer, PlayLayer) {
         return obstacles;
     }
 
-    // Simulates one player for `steps` steps. The button is `heldBefore`
-    // until step `switchAt`, then the other way; with `switchBackAt` >= 0 it
-    // goes back to `heldBefore` on that step. Returns the number of steps
-    // survived (== steps if the path is clear).
-    int simulateWave(
+    struct WaveSim {
+        int survived = 0;            // steps survived (== steps: no crash)
+        char const* cause = "";      // what the crash hit
+    };
+
+    // Which way the wave is moving now: measured from the last step, or,
+    // while sliding (no vertical movement), from the button and gravity.
+    bool waveGoingUp(PlayerObject* player, bool held) {
+        auto const& t = this->waveTrack(player);
+        if (t.delta.y > 0.01f) return true;
+        if (t.delta.y < -0.01f) return false;
+        return held != player->m_isUpsideDown;
+    }
+
+    // Simulates one player for `steps` steps. It keeps its current direction
+    // (`startUp`) until step `switchAt`, then turns; with `switchBackAt` >= 0
+    // it turns back on that step.
+    WaveSim simulateWave(
         PlayerObject* player, std::vector<WaveObstacle> const& obstacles,
-        bool heldBefore, int switchAt, int switchBackAt, int steps
+        bool startUp, int switchAt, int switchBackAt, int steps
     ) {
         auto const& t = this->waveTrack(player);
         float dx = t.delta.x;
@@ -898,65 +914,103 @@ class $modify(BufferPlayLayer, PlayLayer) {
         auto pos = player->getPosition();
         auto box = player->getObjectRect();
         CCPoint offset = ccp(box.getMidX() - pos.x, box.getMidY() - pos.y);
+        // A stale rect would put the hitbox somewhere else entirely.
+        if (std::abs(offset.x) > 15.f || std::abs(offset.y) > 15.f) offset = CCPointZero;
         float halfW = box.size.width / 2, halfH = box.size.height / 2;
         float innerW = halfW * kWaveInnerScale, innerH = halfH * kWaveInnerScale;
         CCPoint center = pos + offset;
 
         for (int i = 0; i < steps; ++i) {
-            bool held = heldBefore;
-            if (i >= switchAt) held = !heldBefore;
-            if (switchBackAt >= 0 && i >= switchBackAt) held = heldBefore;
-            bool up = held != player->m_isUpsideDown;
-            float moveY = up ? dy : -dy;
+            bool up = startUp;
+            if (i >= switchAt) up = !startUp;
+            if (switchBackAt >= 0 && i >= switchBackAt) up = startUp;
 
             float prevX = center.x;
             center.x += dx;
-            center.y += moveY;
+            center.y += up ? dy : -dy;
 
-            // Blocks: running into a side, or the inner box overlapping,
-            // kills; touching a top or bottom slides along it.
+            // Blocks the wave was already level with in x: it moved onto
+            // their top or bottom, so it slides along them.
             for (auto const& o : obstacles) {
                 if (o.hazard) continue;
+                bool wasOver = prevX + halfW > o.rect.getMinX() && prevX - halfW < o.rect.getMaxX();
+                if (!wasOver) continue;
                 CCRect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
                 if (!outer.intersectsRect(o.rect)) continue;
-                bool wasAbove = prevX + halfW > o.rect.getMinX() && prevX - halfW < o.rect.getMaxX();
-                bool innerInY = center.y + innerH > o.rect.getMinY() && center.y - innerH < o.rect.getMaxY();
-                if (!wasAbove && innerInY) return i;
-                CCRect inner(center.x - innerW, center.y - innerH, innerW * 2, innerH * 2);
-                if (inner.intersectsRect(o.rect)) return i;
-                if (center.y < o.rect.getMidY()) center.y = std::min(center.y, o.rect.getMinY() - halfH);
+                if (up) center.y = std::min(center.y, o.rect.getMinY() - halfH);
                 else center.y = std::max(center.y, o.rect.getMaxY() + halfH);
             }
             center.y = std::max(center.y, kFloorY + halfH);
+
+            // Blocks it reaches from the side: a crash if the inner box is
+            // level with them, a corner graze otherwise.
+            CCRect inner(center.x - innerW, center.y - innerH, innerW * 2, innerH * 2);
+            for (auto const& o : obstacles) {
+                if (o.hazard) continue;
+                if (inner.intersectsRect(o.rect)) return { i, "a block" };
+            }
 
             CCRect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
             for (auto const& o : obstacles) {
                 if (!o.hazard) continue;
                 if (o.radius > 0.f) {
-                    if (ccpDistance(o.center, center) <= halfW + o.radius) return i;
+                    if (ccpDistance(o.center, center) <= halfW + o.radius) return { i, "a saw" };
                 }
-                else if (outer.intersectsRect(o.rect)) return i;
+                else if (outer.intersectsRect(o.rect)) return { i, "a spike" };
             }
         }
-        return steps;
+        return { steps, "" };
     }
 
-    // Earliest delay (0..maxDelay) at which firing the input gives every
-    // player a clear path, or -1 if none does.
-    int findClearDelay(bool isPlayer1, bool push, int maxDelay, int followGap) {
+    struct WaveChoice {
+        int delay = 0;           // steps to wait before firing
+        int survivedNow = 0;     // steps survived after firing now
+        int survivedBest = 0;    // steps survived after firing at `delay`
+        char const* causeNow = "";
+    };
+
+    // Picks when to fire. For each delay it measures how long the players
+    // survive after the input fires. Holding the button forever crashes in
+    // most wave parts, which moves with the delay and is no reason to wait;
+    // a delay is only worth it when it survives clearly longer than firing
+    // now. Delays where waiting itself crashes are skipped.
+    WaveChoice chooseWaveDelay(bool isPlayer1, bool push, int maxDelay, int followGap) {
+        constexpr int kMinGain = 3;
         auto players = this->inputPlayers(isPlayer1);
         int lookahead = waveLookahead();
         auto obstacles = this->gatherObstacles(players, lookahead + maxDelay);
-        bool heldBefore = !push;
+        bool held = !push; // button state until the input fires
+
+        WaveChoice choice;
+        int bestDelay = 0, best = -1;
         for (int delay = 0; delay <= maxDelay; ++delay) {
             int steps = lookahead + delay;
             int switchBack = followGap > 0 ? delay + followGap : -1;
-            bool clear = std::all_of(players.begin(), players.end(), [&](PlayerObject* player) {
-                return this->simulateWave(player, obstacles, heldBefore, delay, switchBack, steps) >= steps;
-            });
-            if (clear) return delay;
+            int survived = steps;
+            char const* cause = "";
+            for (auto player : players) {
+                auto sim = this->simulateWave(player, obstacles, this->waveGoingUp(player, held), delay, switchBack, steps);
+                if (sim.survived < survived) {
+                    survived = sim.survived;
+                    cause = sim.cause;
+                }
+            }
+            if (survived < delay) break; // waiting this long crashes first
+            int after = std::min(survived - delay, lookahead);
+            if (delay == 0) {
+                choice.survivedNow = after;
+                choice.causeNow = cause;
+            }
+            if (after > best) {
+                best = after;
+                bestDelay = delay;
+            }
+            if (after >= lookahead) break; // can't do better
         }
-        return -1;
+        choice.survivedBest = std::max(best, 0);
+        if (choice.survivedNow >= lookahead || best < choice.survivedNow + kMinGain) choice.delay = 0;
+        else choice.delay = bestDelay;
+        return choice;
     }
 
     bool waveTracksReady(bool isPlayer1) {
@@ -1021,15 +1075,17 @@ class $modify(BufferPlayLayer, PlayLayer) {
             return false;
         }
 
-        int delay = this->findClearDelay(isPlayer1, down, frames, 0);
-        if (delay == 0) {
-            this->report(fmt::format("wave: path clear, {} passed through", what));
-            return false;
-        }
-        if (delay < 0) {
-            this->report(fmt::format(
-                "wave: {} crashes and so does every step in the next {}, passed through", what, frames
-            ));
+        auto choice = this->chooseWaveDelay(isPlayer1, down, frames, 0);
+        if (choice.delay == 0) {
+            if (choice.survivedNow >= waveLookahead()) {
+                this->report(fmt::format("wave: path clear, {} passed through", what));
+            }
+            else {
+                this->report(fmt::format(
+                    "wave: {} hits {} in {} steps, waiting doesn't help, passed through",
+                    what, choice.causeNow, choice.survivedNow
+                ));
+            }
             return false;
         }
 
@@ -1037,7 +1093,10 @@ class $modify(BufferPlayLayer, PlayLayer) {
         w.active = true;
         w.push = down;
         w.arrivedStep = this->inputStep();
-        this->report(fmt::format("wave: {} now crashes, holding (clear in {} steps)", what, delay));
+        this->report(fmt::format(
+            "wave: {} would hit {} in {} steps, holding {} steps",
+            what, choice.causeNow, choice.survivedNow, choice.delay
+        ));
         return true;
     }
 
@@ -1063,14 +1122,12 @@ class $modify(BufferPlayLayer, PlayLayer) {
             }
             int remaining = std::max(0, bufferFrames() - waited);
             int followGap = w.hasFollow ? w.followGap : 0;
-            int delay = this->findClearDelay(isPlayer1, w.push, remaining, followGap);
-            if (delay == 0) {
+            auto choice = this->chooseWaveDelay(isPlayer1, w.push, remaining, followGap);
+            if (choice.delay == 0) {
                 this->fireWave(isPlayer1);
-                this->report(fmt::format("wave: path clear, {} fired {} steps late", what, waited));
-            }
-            else if (delay < 0) {
-                this->fireWave(isPlayer1);
-                this->report(fmt::format("wave: no clear step left, {} fired {} steps late", what, waited));
+                this->report(choice.survivedNow >= waveLookahead()
+                    ? fmt::format("wave: path clear, {} fired {} steps late", what, waited)
+                    : fmt::format("wave: best moment, {} fired {} steps late", what, waited));
             }
         }
     }
