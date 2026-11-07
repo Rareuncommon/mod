@@ -8,7 +8,7 @@
 	},
 	"id": "yourname.input-buffer",
 	"name": "Input Buffer",
-	"version": "v1.7.1",
+	"version": "v1.7.2",
 	"developer": "yourname",
 	"description": "Practice tool for click patterns, with wave lookahead. Buffer and Snap only work in practice mode or from a start position.",
 	"settings": {
@@ -64,6 +64,12 @@
 			"type": "bool",
 			"name": "Show Click Info",
 			"description": "Show what the mod did with your last click, and why, under the corner label. Every decision is also written to the Geode log.",
+			"default": true
+		},
+		"show-wave-prediction": {
+			"type": "bool",
+			"name": "Show Wave Prediction",
+			"description": "On each wave click, draw what the mod predicted: your hitbox (white), the path if the click fires now (red if it crashes, green if not), the path at the delay it chose (yellow), and the hazards (orange) and blocks (blue) it checked. Details are also written to the Geode log.",
 			"default": true
 		},
 		"toggle-key": {

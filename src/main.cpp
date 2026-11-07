@@ -241,6 +241,10 @@ namespace {
         return Mod::get()->getSettingValue<bool>("enabled");
     }
 
+    bool showWavePrediction() {
+        return Mod::get()->getSettingValue<bool>("show-wave-prediction");
+    }
+
     int waveLookahead() {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("wave-lookahead"));
     }
@@ -404,6 +408,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         WavePending wave[2];
         WaveFollow waveFollow[2];
         bool jumpHeld[2] = {};     // jump state the game has seen per input
+        CCDrawNode* waveDraw = nullptr; // prediction overlay, in level space
 
         CCLabelBMFont* indicator = nullptr;
         std::string indicatorText;
@@ -423,6 +428,13 @@ class $modify(BufferPlayLayer, PlayLayer) {
         label->setID("input-buffer-indicator"_spr);
         this->addChild(label, 1000);
         m_fields->indicator = label;
+
+        if (m_objectLayer) {
+            auto draw = CCDrawNode::create();
+            draw->setID("wave-prediction"_spr);
+            m_objectLayer->addChild(draw, 9999);
+            m_fields->waveDraw = draw;
+        }
 
         this->updateIndicator();
         return true;
@@ -630,6 +642,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         this->clearBuffer();
         fields->attemptSaved = false;
         this->resetWaveTracks();
+        if (fields->waveDraw) fields->waveDraw->clear();
         // The start position may have changed, which selects another best run.
         this->ensureReference();
         this->rewindToStep();
@@ -905,7 +918,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
     // it turns back on that step.
     WaveSim simulateWave(
         PlayerObject* player, std::vector<WaveObstacle> const& obstacles,
-        bool startUp, int switchAt, int switchBackAt, int steps
+        bool startUp, int switchAt, int switchBackAt, int steps,
+        std::vector<CCPoint>* path = nullptr
     ) {
         auto const& t = this->waveTrack(player);
         float dx = t.delta.x;
@@ -919,6 +933,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         float halfW = box.size.width / 2, halfH = box.size.height / 2;
         float innerW = halfW * kWaveInnerScale, innerH = halfH * kWaveInnerScale;
         CCPoint center = pos + offset;
+        if (path) path->push_back(center);
 
         for (int i = 0; i < steps; ++i) {
             bool up = startUp;
@@ -941,6 +956,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
                 else center.y = std::max(center.y, o.rect.getMaxY() + halfH);
             }
             center.y = std::max(center.y, kFloorY + halfH);
+            if (path) path->push_back(center);
 
             // Blocks it reaches from the side: a crash if the inner box is
             // level with them, a corner graze otherwise.
@@ -1010,7 +1026,77 @@ class $modify(BufferPlayLayer, PlayLayer) {
         choice.survivedBest = std::max(best, 0);
         if (choice.survivedNow >= lookahead || best < choice.survivedNow + kMinGain) choice.delay = 0;
         else choice.delay = bestDelay;
+
+        this->logWaveChoice(players, obstacles, held, maxDelay, followGap, choice);
+        if (showWavePrediction()) this->drawWaveChoice(players, obstacles, held, followGap, choice);
         return choice;
+    }
+
+    void logWaveChoice(
+        std::vector<PlayerObject*> const& players, std::vector<WaveObstacle> const& obstacles,
+        bool held, int maxDelay, int followGap, WaveChoice const& choice
+    ) {
+        int hazards = 0;
+        for (auto const& o : obstacles) hazards += o.hazard ? 1 : 0;
+        for (auto player : players) {
+            auto const& t = this->waveTrack(player);
+            auto pos = player->getPosition();
+            auto box = player->getObjectRect();
+            log::info(
+                "Wave: pos ({:.1f}, {:.1f}) rect ({:.1f}, {:.1f}, {:.1f}x{:.1f}) delta ({:.2f}, {:.2f}) "
+                "slope {:.2f} size {:.2f} upsideDown {} held {} goingUp {}",
+                pos.x, pos.y, box.origin.x, box.origin.y, box.size.width, box.size.height,
+                t.delta.x, t.delta.y, this->waveSlope(player), player->m_vehicleSize,
+                player->m_isUpsideDown, held, this->waveGoingUp(player, held)
+            );
+        }
+        log::info(
+            "Wave: {} hazards, {} solids nearby; max delay {}, tap gap {}; now survives {} ({}), "
+            "best {} at delay {}",
+            hazards, obstacles.size() - hazards, maxDelay, followGap, choice.survivedNow,
+            choice.causeNow, choice.survivedBest, choice.delay
+        );
+    }
+
+    // Draws what the prediction saw: the hitbox, the path if the input
+    // fires now (red if it crashes, green if not), the path at the chosen
+    // delay (yellow), and the obstacles it checked (hazards orange, blocks
+    // blue).
+    void drawWaveChoice(
+        std::vector<PlayerObject*> const& players, std::vector<WaveObstacle> const& obstacles,
+        bool held, int followGap, WaveChoice const& choice
+    ) {
+        auto draw = m_fields->waveDraw;
+        if (!draw) return;
+        draw->clear();
+
+        ccColor4F none { 0.f, 0.f, 0.f, 0.f };
+        for (auto const& o : obstacles) {
+            ccColor4F color = o.hazard ? ccColor4F { 1.f, .5f, 0.f, 1.f } : ccColor4F { .2f, .5f, 1.f, 1.f };
+            if (o.radius > 0.f) {
+                draw->drawCircle(o.center, o.radius, none, 1.f, color, 24);
+            }
+            else {
+                draw->drawRect(o.rect.origin, ccp(o.rect.getMaxX(), o.rect.getMaxY()), none, 1.f, color);
+            }
+        }
+
+        int lookahead = waveLookahead();
+        auto drawPath = [&](PlayerObject* player, int delay, ccColor4F color) {
+            std::vector<CCPoint> path;
+            int switchBack = followGap > 0 ? delay + followGap : -1;
+            this->simulateWave(player, obstacles, this->waveGoingUp(player, held), delay, switchBack, lookahead + delay, &path);
+            for (size_t i = 1; i < path.size(); ++i) draw->drawSegment(path[i - 1], path[i], .75f, color);
+            if (!path.empty()) draw->drawDot(path.back(), 2.f, color);
+        };
+
+        bool crashesNow = choice.survivedNow < lookahead;
+        for (auto player : players) {
+            auto box = player->getObjectRect();
+            draw->drawRect(box.origin, ccp(box.getMaxX(), box.getMaxY()), none, 1.f, ccColor4F { 1.f, 1.f, 1.f, 1.f });
+            drawPath(player, 0, crashesNow ? ccColor4F { 1.f, .2f, .2f, 1.f } : ccColor4F { .2f, 1.f, .2f, 1.f });
+            if (choice.delay > 0) drawPath(player, choice.delay, ccColor4F { 1.f, 1.f, .2f, 1.f });
+        }
     }
 
     bool waveTracksReady(bool isPlayer1) {
@@ -1082,8 +1168,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
             }
             else {
                 this->report(fmt::format(
-                    "wave: {} hits {} in {} steps, waiting doesn't help, passed through",
-                    what, choice.causeNow, choice.survivedNow
+                    "wave: {} hits {} in {} steps, best wait survives {}, passed through",
+                    what, choice.causeNow, choice.survivedNow, choice.survivedBest
                 ));
             }
             return false;
