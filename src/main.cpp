@@ -142,6 +142,12 @@
 // A release that arrives while its press is held keeps its gap to the press
 // (the tap length), and the path is simulated with that release.
 //
+// Live prediction (`live-prediction`): a display only. Every step it draws
+// the path if the player clicked (or released) now and the path if they
+// don't, with the same simulation. The level's objects are re-scanned every
+// kLiveRescanSteps steps, over an area kLiveScanMargin steps bigger than the
+// path, instead of every step.
+//
 // Snap releases: a release that arrives while its press is still held back
 // is shifted by the same number of steps as the press (so the hold length is
 // kept), then snapped to a reference release if one is within the window.
@@ -416,6 +422,17 @@ namespace {
         return Mod::get()->getSettingValue<bool>("show-wave-prediction");
     }
 
+    bool showLivePrediction() {
+        return Mod::get()->getSettingValue<bool>("live-prediction");
+    }
+
+    // Live prediction re-scans the level's objects this often (in steps),
+    // not every step, since a scan goes through every object in the level.
+    constexpr int kLiveRescanSteps = 15;
+    // Extra steps of path the scanned area covers, so it stays valid until
+    // the next scan.
+    constexpr int kLiveScanMargin = 30;
+
     int waveLookahead() {
         return static_cast<int>(Mod::get()->getSettingValue<int64_t>("wave-lookahead"));
     }
@@ -580,6 +597,9 @@ class $modify(BufferPlayLayer, PlayLayer) {
         bool heldDuring[2] = {};   // jump state during the step just simulated
         bool pressedDuring[2] = {};// a press happened in that step
         CCDrawNode* waveDraw = nullptr; // prediction overlay, in level space
+        CCDrawNode* liveDraw = nullptr; // live prediction, redrawn every step
+        std::vector<WaveObstacle> liveObstacles;
+        int liveScanStep = -1000;       // step of the last object scan
 
         CCLabelBMFont* indicator = nullptr;
         std::string indicatorText;
@@ -605,6 +625,11 @@ class $modify(BufferPlayLayer, PlayLayer) {
             draw->setID("wave-prediction"_spr);
             m_objectLayer->addChild(draw, 9999);
             m_fields->waveDraw = draw;
+
+            auto live = CCDrawNode::create();
+            live->setID("live-prediction"_spr);
+            m_objectLayer->addChild(live, 9998);
+            m_fields->liveDraw = live;
         }
 
         this->updateIndicator();
@@ -748,7 +773,71 @@ class $modify(BufferPlayLayer, PlayLayer) {
         }
         // After every input the mod fires this step.
         this->snapshotInputs();
+        this->updateLivePrediction();
         this->updateIndicator();
+    }
+
+    // Live prediction: every step, draws the path if the player clicked (or
+    // released) now, green or red if it crashes, and the path if they
+    // don't, in white. Only a display; it changes no input.
+    void updateLivePrediction() {
+        auto fields = m_fields.self();
+        auto draw = fields->liveDraw;
+        if (!draw) return;
+        draw->clear();
+        if (!showLivePrediction() || !modEnabled() || currentMode() != Mode::Buffer || !this->assistAllowed()) return;
+        if (!m_started || m_hasCompletedLevel) return;
+
+        bool twoPlayer = m_levelSettings && m_levelSettings->m_twoPlayerMode;
+        std::vector<bool> channels { true };
+        if (twoPlayer) channels.push_back(false);
+
+        int lookahead = waveLookahead();
+        bool rescan = fields->step < fields->liveScanStep || fields->step - fields->liveScanStep >= kLiveRescanSteps;
+
+        for (bool isPlayer1 : channels) {
+            if (!this->lookaheadApplies(isPlayer1)) continue;
+            if (!this->waveTracksReady(isPlayer1) || !this->physicsReady(isPlayer1)) continue;
+            auto players = this->inputPlayers(isPlayer1);
+            bool ground = std::any_of(players.begin(), players.end(), [](PlayerObject* player) {
+                return isGroundMode(flyMode(player));
+            });
+            int steps = ground ? std::max(lookahead, kGroundLookahead) : lookahead;
+
+            if (rescan) {
+                // Both channels' players, so one scan serves both.
+                auto all = this->inputPlayers(true);
+                if (twoPlayer) {
+                    auto p2 = this->inputPlayers(false);
+                    all.insert(all.end(), p2.begin(), p2.end());
+                }
+                fields->liveObstacles = this->gatherObstacles(all, std::max(lookahead, kGroundLookahead) + kLiveScanMargin);
+                fields->liveScanStep = fields->step;
+                rescan = false;
+            }
+
+            bool held = fields->jumpHeld[isPlayer1 ? 1 : 0];
+            for (auto player : players) {
+                auto mode = flyMode(player);
+                // A release only acts in wave, ship and robot.
+                bool actionMatters = !held || mode == FlyMode::Wave || mode == FlyMode::Ship || mode == FlyMode::Robot;
+
+                std::vector<CCPoint> path;
+                this->simulateWave(player, fields->liveObstacles, held, steps + 1, -1, steps, &path);
+                for (size_t i = 1; i < path.size(); ++i) {
+                    draw->drawSegment(path[i - 1], path[i], .5f, ccColor4F { 1.f, 1.f, 1.f, .45f });
+                }
+
+                if (!actionMatters) continue;
+                path.clear();
+                auto sim = this->simulateWave(player, fields->liveObstacles, held, 0, -1, steps, &path);
+                ccColor4F color = sim.survived >= steps
+                    ? ccColor4F { .2f, 1.f, .2f, .8f }
+                    : ccColor4F { 1.f, .2f, .2f, .8f };
+                for (size_t i = 1; i < path.size(); ++i) draw->drawSegment(path[i - 1], path[i], .6f, color);
+                if (!path.empty() && sim.survived < steps) draw->drawDot(path.back(), 2.5f, color);
+            }
+        }
     }
 
     PathPoint currentPoint() {
@@ -816,6 +905,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
         fields->attemptSaved = false;
         this->resetWaveTracks();
         if (fields->waveDraw) fields->waveDraw->clear();
+        if (fields->liveDraw) fields->liveDraw->clear();
+        fields->liveScanStep = -1000;
         // The start position may have changed, which selects another best run.
         this->ensureReference();
         this->rewindToStep();
