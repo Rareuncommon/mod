@@ -8,7 +8,7 @@ else()
 endif()
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-project(InputBuffer VERSION 1.8.1)
+project(InputBuffer VERSION 1.9.0)
 
 add_library(${PROJECT_NAME} SHARED
 	src/main.cpp

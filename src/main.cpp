@@ -84,8 +84,10 @@
 // platformer or sideways). Snap mode covers every mode,
 // because it times inputs against the reference instead of the player state.
 //
-// Lookahead (Buffer mode: wave, ship, UFO, swing): these modes have no "can
-// act" moment, a click acts the instant it happens. So instead of waiting for
+// Lookahead (Buffer mode: wave, ship, UFO, swing, and cube, ball and robot
+// on the ground): a click there acts the instant it happens, so there is no
+// "can act" moment to wait for, and a click that is early by a frame jumps
+// or turns too soon. So instead of waiting for
 // one, the mod simulates ahead. On a press or release it predicts, for every
 // delay from 0 to `buffer-frames` steps, how many steps the player survives
 // after the input fires (up to `wave-lookahead`). The button is assumed to
@@ -97,12 +99,15 @@
 // are never moved, and a held input is always fired, never dropped. UFO and
 // swing only act on presses, so their releases pass through.
 //
-// Ship, UFO and swing physics are learned while playing (FlightPhysics, per
-// mode and size, kept for the session): every clean flying step measures how
-// the vertical speed changed, split by whether the button was held (ship),
-// the speed right after a click (UFO jump), and the pull toward gravity (UFO
-// falling, swing), plus the fastest speeds seen. Until a mode has enough
-// measurements, its inputs pass through.
+// Ship, UFO, swing, cube, ball and robot physics are learned while playing
+// (FlightPhysics, per mode and size, kept for the session): every clean
+// airborne step measures how the vertical speed changed, split by whether
+// the button was held (ship, robot), the speed right after a click (UFO and
+// cube/robot jump, ball flip), and the pull toward gravity, plus the fastest
+// speeds seen. Until a mode has enough measurements, its inputs pass
+// through. Ground modes look at least kGroundLookahead steps ahead so a
+// whole jump is seen, and holding jumps again on every landing. Clicks on an
+// orb and spider clicks are not simulated.
 //
 // The prediction is the mod's own model, not the game's physics:
 //   - x moves by the last step's measured x movement (speed portals, speed
@@ -261,7 +266,7 @@ namespace {
     };
 
     // Modes the lookahead simulates.
-    enum class FlyMode { None, Wave, Ship, Ufo, Swing };
+    enum class FlyMode { None, Wave, Ship, Ufo, Swing, Cube, Ball, Robot };
 
     FlyMode flyMode(PlayerObject* player) {
         if (!player || player->m_isDead || player->m_isPlatformer || player->m_isSideways) return FlyMode::None;
@@ -269,8 +274,26 @@ namespace {
         if (player->m_isShip) return FlyMode::Ship;
         if (player->m_isBird) return FlyMode::Ufo;
         if (player->m_isSwing) return FlyMode::Swing;
-        return FlyMode::None;
+        if (player->m_isBall) return FlyMode::Ball;
+        if (player->m_isRobot) return FlyMode::Robot;
+        if (player->m_isSpider) return FlyMode::None; // teleports, not simulated
+        return FlyMode::Cube;
     }
+
+    // Modes where a click acts at once wherever the player is.
+    bool isFlyingMode(FlyMode mode) {
+        return mode == FlyMode::Wave || mode == FlyMode::Ship || mode == FlyMode::Ufo || mode == FlyMode::Swing;
+    }
+
+    // Modes where a click acts at once on the ground (in the air, the
+    // normal buffer waits for landing instead).
+    bool isGroundMode(FlyMode mode) {
+        return mode == FlyMode::Cube || mode == FlyMode::Ball || mode == FlyMode::Robot;
+    }
+
+    // A ground-mode jump lasts longer than the lookahead setting usually
+    // covers, so they look at least this far ahead to see where it lands.
+    constexpr int kGroundLookahead = 120;
 
     // A running estimate of one number, from measurements. Measurements far
     // off the estimate (a bump into a block, a portal) are ignored once there
@@ -292,7 +315,9 @@ namespace {
         Estimate accelHeld;      // ship: speed change per step while held
         Estimate accelFree;      // ship released, UFO: gravity (negative);
                                  // swing: pull toward gravity (negative)
-        Estimate impulse;        // UFO: speed on the step of a click
+        Estimate impulse;        // UFO: speed on the step of a click;
+                                 // cube, robot: jump speed; ball: speed
+                                 // after a gravity flip
         float maxUp = 0.f;       // fastest speed seen away from gravity
         float maxDown = 0.f;     // fastest speed seen toward gravity
 
@@ -301,14 +326,17 @@ namespace {
                 case FlyMode::Ship: return accelHeld.count >= 5 && accelFree.count >= 5;
                 case FlyMode::Ufo: return impulse.count >= 2 && accelFree.count >= 10;
                 case FlyMode::Swing: return accelFree.count >= 10;
+                case FlyMode::Cube:
+                case FlyMode::Ball:
+                case FlyMode::Robot: return impulse.count >= 2 && accelFree.count >= 10;
                 default: return true;
             }
         }
     };
 
-    // [mode: ship, UFO, swing][mini]. Kept for the whole session, since the
-    // physics are the same in every level.
-    FlightPhysics g_physics[3][2];
+    // [mode: ship, UFO, swing, cube, ball, robot][mini]. Kept for the whole
+    // session, since the physics are the same in every level.
+    FlightPhysics g_physics[6][2];
 
     FlightPhysics* physicsFor(PlayerObject* player) {
         int index;
@@ -316,6 +344,9 @@ namespace {
             case FlyMode::Ship: index = 0; break;
             case FlyMode::Ufo: index = 1; break;
             case FlyMode::Swing: index = 2; break;
+            case FlyMode::Cube: index = 3; break;
+            case FlyMode::Ball: index = 4; break;
+            case FlyMode::Robot: index = 5; break;
             default: return nullptr;
         }
         return &g_physics[index][player->m_vehicleSize < 1.f ? 1 : 0];
@@ -844,7 +875,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
     bool onBufferButton(bool down, int button, bool isPlayer1) {
         // A press held from another mode is finished by the normal buffer.
         if (button == static_cast<int>(PlayerButton::Jump) && !slot(button, isPlayer1).pending
-            && this->inputIsWave(isPlayer1)) {
+            && (m_fields->wave[isPlayer1 ? 1 : 0].active || this->lookaheadApplies(isPlayer1))) {
             return this->onWaveButton(down, isPlayer1);
         }
         auto& s = slot(button, isPlayer1);
@@ -962,7 +993,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
     }
 
     static bool isSimulatable(PlayerObject* player) {
-        return flyMode(player) != FlyMode::None;
+        return isFlyingMode(flyMode(player));
     }
 
     // Every player this input drives is in wave, ship, UFO or swing.
@@ -970,6 +1001,20 @@ class $modify(BufferPlayLayer, PlayLayer) {
         auto players = this->inputPlayers(isPlayer1);
         if (players.empty()) return false;
         return std::all_of(players.begin(), players.end(), isSimulatable);
+    }
+
+    // Every player this input drives is a cube, ball or robot standing on
+    // the ground (not on an orb, which isn't simulated).
+    bool inputIsGroundJump(bool isPlayer1) {
+        auto players = this->inputPlayers(isPlayer1);
+        if (players.empty()) return false;
+        return std::all_of(players.begin(), players.end(), [&](PlayerObject* player) {
+            return isGroundMode(flyMode(player)) && this->onGround(player) && !touchingRing(player);
+        });
+    }
+
+    bool lookaheadApplies(bool isPlayer1) {
+        return this->inputIsWave(isPlayer1) || this->inputIsGroundJump(isPlayer1);
     }
 
     WaveTrack& waveTrack(PlayerObject* player) {
@@ -1004,7 +1049,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
             t.hasPosition = true;
             t.mode = static_cast<int>(flyMode(player));
             t.upsideDown = player->m_isUpsideDown;
-            t.onGround = player->m_isOnGround;
+            t.onGround = player->m_isOnGround
+                && (player->m_isOnSlope || player->m_wasOnSlope || !t.hasDelta || std::abs(t.delta.y) < 0.01f);
         }
     }
 
@@ -1012,10 +1058,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
     void learnPhysics(PlayerObject* player, WaveTrack const& t, CCPoint delta) {
         auto physics = physicsFor(player);
         if (!physics || !t.hasDelta) return;
-        // Only clean flying steps: same mode and gravity as the step before,
-        // not on the ground, moving, no teleport.
-        if (t.mode != static_cast<int>(flyMode(player)) || t.upsideDown != player->m_isUpsideDown) return;
-        if (t.onGround || player->m_isOnGround) return;
+        auto mode = flyMode(player);
+        if (t.mode != static_cast<int>(mode)) return;
         if (std::abs(delta.x) < 0.01f || std::abs(delta.y) > 40.f || std::abs(t.delta.y) > 40.f) return;
 
         float g = player->m_isUpsideDown ? -1.f : 1.f;
@@ -1025,7 +1069,21 @@ class $modify(BufferPlayLayer, PlayLayer) {
         bool held = m_fields->heldDuring[ch];
         bool pressed = m_fields->pressedDuring[ch];
 
-        switch (flyMode(player)) {
+        // Ground modes: the step that left the ground on a held button is
+        // the jump (a ball flips gravity on it).
+        if (isGroundMode(mode) && t.onGround && (held || pressed) && speed > 0.f) {
+            bool flipped = t.upsideDown != player->m_isUpsideDown;
+            if (mode == FlyMode::Ball ? flipped : !flipped) physics->impulse.add(speed);
+            return;
+        }
+
+        // Otherwise only clean airborne steps: same gravity as the step
+        // before, not on the ground at either end, moving, no teleport.
+        if (t.upsideDown != player->m_isUpsideDown) return;
+        bool groundNow = player->m_isOnGround && std::abs(delta.y) < 0.01f;
+        if (t.onGround || groundNow) return;
+
+        switch (mode) {
             case FlyMode::Ship:
                 if (speed == 0.f || before == 0.f) return; // sliding along something
                 if (held) physics->accelHeld.add(accel);
@@ -1039,6 +1097,14 @@ class $modify(BufferPlayLayer, PlayLayer) {
                 if (pressed) return; // gravity flipped on this step
                 if (speed == 0.f || before == 0.f) return;
                 physics->accelFree.add(accel);
+                break;
+            case FlyMode::Cube:
+            case FlyMode::Ball:
+            case FlyMode::Robot:
+                if (speed == 0.f || before == 0.f) return;
+                // The robot's jump goes higher while held.
+                if (mode == FlyMode::Robot && held) physics->accelHeld.add(accel);
+                else physics->accelFree.add(accel);
                 break;
             default: return;
         }
@@ -1143,6 +1209,8 @@ class $modify(BufferPlayLayer, PlayLayer) {
         bool startUp = this->waveGoingUp(player, heldBefore);
         float g = player->m_isUpsideDown ? -1.f : 1.f; // gravity frame
         float speed = g * t.delta.y;                    // in the gravity frame
+        bool grounded = isGroundMode(mode) && this->onGround(player);
+        if (grounded) speed = 0.f;
 
         auto pos = player->getPosition();
         auto box = player->getObjectRect();
@@ -1183,6 +1251,26 @@ class $modify(BufferPlayLayer, PlayLayer) {
                             speed = -speed;
                         }
                         speed += physics->accelFree.value;
+                        break;
+                    case FlyMode::Cube:
+                    case FlyMode::Robot:
+                        // Holding jumps again on every landing.
+                        if (grounded && held) {
+                            speed = physics->impulse.value;
+                            grounded = false;
+                        }
+                        else if (mode == FlyMode::Robot && held && physics->accelHeld.count >= 5) {
+                            speed += physics->accelHeld.value;
+                        }
+                        else speed += physics->accelFree.value;
+                        break;
+                    case FlyMode::Ball:
+                        if (grounded && held) {
+                            g = -g;
+                            speed = physics->impulse.value;
+                            grounded = false;
+                        }
+                        else speed += physics->accelFree.value;
                         break;
                     default: break;
                 }
@@ -1257,7 +1345,12 @@ class $modify(BufferPlayLayer, PlayLayer) {
             }
 
             // Pushed out by a block, slope or the floor: stop moving that way.
-            if (mode != FlyMode::Wave && center.y != movedY) speed = 0.f;
+            if (mode != FlyMode::Wave && center.y != movedY) {
+                // Pushed back against gravity: landed on something.
+                grounded = g * moveY <= 0.f;
+                speed = 0.f;
+            }
+            else grounded = false;
             if (path) path->push_back(center);
 
             CCRect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
@@ -1277,6 +1370,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         int survivedNow = 0;     // steps survived after firing now
         int survivedBest = 0;    // steps survived after firing at `delay`
         char const* causeNow = "";
+        int lookahead = 0;       // steps looked at after the input
     };
 
     // Picks when to fire. For each delay it measures how long the players
@@ -1288,10 +1382,15 @@ class $modify(BufferPlayLayer, PlayLayer) {
         constexpr int kMinGain = 3;
         auto players = this->inputPlayers(isPlayer1);
         int lookahead = waveLookahead();
+        bool ground = std::any_of(players.begin(), players.end(), [](PlayerObject* player) {
+            return isGroundMode(flyMode(player));
+        });
+        if (ground) lookahead = std::max(lookahead, kGroundLookahead);
         auto obstacles = this->gatherObstacles(players, lookahead + maxDelay);
         bool held = !push; // button state until the input fires
 
         WaveChoice choice;
+        choice.lookahead = lookahead;
         int bestDelay = 0, best = -1;
         for (int delay = 0; delay <= maxDelay; ++delay) {
             int steps = lookahead + delay;
@@ -1391,7 +1490,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
             }
         }
 
-        int lookahead = waveLookahead();
+        int lookahead = choice.lookahead;
         auto drawPath = [&](PlayerObject* player, int delay, ccColor4F color) {
             std::vector<CCPoint> path;
             int switchBack = followGap > 0 ? delay + followGap : -1;
@@ -1478,12 +1577,12 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
         // Not a change of direction (e.g. a repeat): nothing to time.
         if (fields->jumpHeld[ch] == down) return false;
-        // UFO and swing only act on presses.
+        // UFO, swing, cube and ball only act on presses.
         if (!down) {
             auto players = this->inputPlayers(isPlayer1);
             bool releaseMatters = std::any_of(players.begin(), players.end(), [](PlayerObject* player) {
                 auto m = flyMode(player);
-                return m == FlyMode::Wave || m == FlyMode::Ship;
+                return m == FlyMode::Wave || m == FlyMode::Ship || m == FlyMode::Robot;
             });
             if (!releaseMatters) return false;
         }
@@ -1501,7 +1600,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
         auto choice = this->chooseWaveDelay(isPlayer1, down, frames, 0);
         if (choice.delay == 0) {
-            if (choice.survivedNow >= waveLookahead()) {
+            if (choice.survivedNow >= choice.lookahead) {
                 this->report(fmt::format("{}: path clear, {} passed through", mode, what));
             }
             else {
@@ -1540,7 +1639,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
             char const* what = w.push ? "click" : "release";
             auto mode = this->modeName(isPlayer1);
 
-            if (!active || !this->inputIsWave(isPlayer1)) {
+            if (!active || !this->lookaheadApplies(isPlayer1)) {
                 this->fireWave(isPlayer1);
                 this->report(fmt::format("{}: mode changed or mod off, {} fired {} steps late", mode, what, waited));
                 continue;
@@ -1550,7 +1649,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
             auto choice = this->chooseWaveDelay(isPlayer1, w.push, remaining, followGap);
             if (choice.delay == 0) {
                 this->fireWave(isPlayer1);
-                this->report(choice.survivedNow >= waveLookahead()
+                this->report(choice.survivedNow >= choice.lookahead
                     ? fmt::format("{}: path clear, {} fired {} steps late", mode, what, waited)
                     : fmt::format("{}: best moment, {} fired {} steps late", mode, what, waited));
             }
