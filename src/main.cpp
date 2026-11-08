@@ -58,6 +58,9 @@
 // "Can act" state used by Buffer mode for the discrete modes:
 //   m_isOnGround      inline code clears it in pushDown() and spawnFromPlayer(),
 //                     and hitGroundNoJump() saves/restores it around hitGround().
+//                     In play it stays set in the air, so the mod only counts
+//                     it while the player also did not move vertically last
+//                     step (or is on a slope).
 //   m_touchingRings   CCArray*; addToTouchedRings() (inline) adds the ring being
 //                     touched. When the game empties it is not visible in the
 //                     bindings.
@@ -382,10 +385,7 @@ namespace {
         return player->isFlying();
     }
 
-    bool canAct(PlayerObject* player) {
-        if (!player || player->m_isDead) return false;
-        if (isContinuousMode(player)) return true;
-        if (player->m_isOnGround) return true;
+    bool touchingRing(PlayerObject* player) {
         return player->m_touchingRings && player->m_touchingRings->count() > 0;
     }
 
@@ -790,9 +790,46 @@ class $modify(BufferPlayLayer, PlayLayer) {
     // input drives both players in dual mode.
     bool inputCanAct(bool isPlayer1) {
         bool twoPlayer = m_levelSettings && m_levelSettings->m_twoPlayerMode;
-        if (twoPlayer) return canAct(isPlayer1 ? m_player1 : m_player2);
-        if (canAct(m_player1)) return true;
-        return m_gameState.m_isDualMode && canAct(m_player2);
+        if (twoPlayer) return this->canAct(isPlayer1 ? m_player1 : m_player2);
+        if (this->canAct(m_player1)) return true;
+        return m_gameState.m_isDualMode && this->canAct(m_player2);
+    }
+
+    // m_isOnGround is set on landing but is not reliably cleared when the
+    // player leaves the ground, so it only counts while the player also did
+    // not move vertically last step (on a slope it moves, so that counts).
+    bool onGround(PlayerObject* player) {
+        if (!player->m_isOnGround) return false;
+        if (player->m_isOnSlope || player->m_wasOnSlope) return true;
+        auto const& t = this->waveTrack(player);
+        if (!t.hasDelta) return true;
+        return std::abs(t.delta.y) < 0.01f;
+    }
+
+    bool canAct(PlayerObject* player) {
+        if (!player || player->m_isDead) return false;
+        if (isContinuousMode(player)) return true;
+        return this->onGround(player) || touchingRing(player);
+    }
+
+    // Why the player can act, for the click info.
+    char const* canActReason(bool isPlayer1) {
+        bool twoPlayer = m_levelSettings && m_levelSettings->m_twoPlayerMode;
+        auto player = twoPlayer && !isPlayer1 ? m_player2 : m_player1;
+        if (player && touchingRing(player)) return "touching an orb";
+        return "on the ground";
+    }
+
+    void logGroundState(PlayerObject* player) {
+        if (!player) return;
+        auto const& t = this->waveTrack(player);
+        log::info(
+            "Ground: m_isOnGround {} m_isOnGround2 {} m_isOnGround3 {} m_isOnGround4 {} onSlope {}/{} "
+            "rings {} last dy {:.3f}",
+            player->m_isOnGround, player->m_isOnGround2, player->m_isOnGround3, player->m_isOnGround4,
+            player->m_isOnSlope, player->m_wasOnSlope,
+            player->m_touchingRings ? player->m_touchingRings->count() : 0, t.hasDelta ? t.delta.y : 0.f
+        );
     }
 
     bool inputIsContinuous(bool isPlayer1) {
@@ -827,8 +864,9 @@ class $modify(BufferPlayLayer, PlayLayer) {
             this->report(fmt::format("{}: Buffer can't simulate this (platformer or sideways), use Snap", gamemodeName(player)));
             return false;
         }
+        this->logGroundState(player);
         if (inputCanAct(isPlayer1)) {
-            this->report(fmt::format("{}: could already jump, passed through", gamemodeName(player)));
+            this->report(fmt::format("{}: could already jump ({}), passed through", gamemodeName(player), this->canActReason(isPlayer1)));
             return false;
         }
 
