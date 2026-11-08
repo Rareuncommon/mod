@@ -256,7 +256,7 @@ inline Result simulate(
             up = moveY > 0.f;
         }
 
-        float prevY = center.y;
+        float prevX = center.x, prevY = center.y;
         center.x += dx;
         center.y += moveY;
         float movedY = center.y;
@@ -306,10 +306,12 @@ inline Result simulate(
                 // Surface rise per unit moved in the player's direction.
                 float rise = (o.y1 - o.y0) / o.rect.size.width * dir;
                 bool parallel = std::abs(waveRise - rise) < 0.2f;
-                // Only a surface the player reached this step (within one
-                // step's vertical move) can be landed on; deeper means it ran
-                // into the slope's face from the side.
+                // Only a surface the player reached this step (on or clear of
+                // it last step, within one step's vertical move now) can be
+                // landed on; one it was already in (beside its face or under
+                // its tip) is a side hit, as for blocks.
                 float reach = std::abs(moveY) + 1.5f;
+                float prevLeft = prevX - halfW, prevRight = prevX + halfW;
                 // Non-wave players are pushed up a floor rising (or down a
                 // ceiling coming down) in their direction: the surface also
                 // moves toward them by its rise over one step. Cube, ball
@@ -323,23 +325,26 @@ inline Result simulate(
                     float surface = std::max(o.surfaceAt(left), o.surfaceAt(right));
                     if (center.y - halfH >= surface) continue;
                     if (o.deadly) return { i, "a hazard slope" };
-                    bool landing = surface + halfH - center.y <= reach;
+                    bool wasOn = prevY - halfH >= std::max(o.surfaceAt(prevLeft), o.surfaceAt(prevRight)) - 0.01f;
+                    bool landing = wasOn && surface + halfH - center.y <= reach;
                     if (landing && (parallel || rise <= 0.05f || climbs)) {
                         center.y = surface + halfH;
                         continue;
                     }
-                    if (centerOver && center.y - innerH < mid) return { i, "a slope" };
+                    // Inside the triangle: past its line and level with its base.
+                    if (centerOver && center.y - innerH < mid && center.y + innerH > o.rect.getMinY()) return { i, "a slope" };
                 }
                 else {
                     float surface = std::min(o.surfaceAt(left), o.surfaceAt(right));
                     if (center.y + halfH <= surface) continue;
                     if (o.deadly) return { i, "a hazard slope" };
-                    bool landing = center.y + halfH - surface <= reach;
+                    bool wasOn = prevY + halfH <= std::min(o.surfaceAt(prevLeft), o.surfaceAt(prevRight)) + 0.01f;
+                    bool landing = wasOn && center.y + halfH - surface <= reach;
                     if (landing && (parallel || rise >= -0.05f || climbs)) {
                         center.y = surface - halfH;
                         continue;
                     }
-                    if (centerOver && center.y + innerH > mid) return { i, "a slope" };
+                    if (centerOver && center.y + innerH > mid && center.y - innerH < o.rect.getMaxY()) return { i, "a slope" };
                 }
             }
         }

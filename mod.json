@@ -8,7 +8,7 @@
 	},
 	"id": "yourname.input-buffer",
 	"name": "Input Buffer",
-	"version": "v1.10.1",
+	"version": "v1.11.0",
 	"developer": "yourname",
 	"description": "Practice tool for click patterns, with a lookahead that holds early clicks that would crash. Buffer and Snap only work in practice mode or from a start position.",
 	"settings": {

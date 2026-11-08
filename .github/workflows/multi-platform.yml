@@ -7,6 +7,16 @@ on:
       - "**"
 
 jobs:
+  test:
+    name: Prediction tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests
+        run: tests/run.sh
+
   build:
     strategy:
       fail-fast: false
