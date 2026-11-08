@@ -131,9 +131,11 @@
 //   - Slopes (Slope) are the line from slopeYPos() at the left and right of
 //     their rect, solid below it (slopeFloorTop()) or above it. The wave
 //     slides along one it moves parallel to, or lands on one that is flat or
-//     falls away in its direction (like a floor or ceiling); running into a
-//     slope's rising face kills once the inner box is past the line, and a
-//     slope with m_slopeIsHazard kills on touch.
+//     falls away in its direction (like a floor or ceiling), but only when it
+//     reached the surface this step (within one step's vertical move); deeper
+//     means it ran into the slope's face. Running into a face kills once the
+//     inner box is past the line, and a slope with m_slopeIsHazard kills on
+//     touch.
 //   - Objects are taken where they are now: moving objects, triggers that
 //     toggle groups, orbs and portals inside the lookahead are not
 //     simulated, and neither is a ceiling.
@@ -1464,25 +1466,35 @@ class $modify(BufferPlayLayer, PlayLayer) {
                     // Surface rise per unit moved in the wave's direction.
                     float rise = (o.y1 - o.y0) / o.rect.size.width * dir;
                     bool parallel = std::abs(waveRise - rise) < 0.2f;
+                    // Only a surface the player reached this step (within one
+                    // step's vertical move) can be landed on; deeper means it
+                    // ran into the slope's face from the side.
+                    float reach = std::abs(moveY) + 1.5f;
+                    bool centerOver = center.x >= o.rect.getMinX() && center.x <= o.rect.getMaxX();
+                    float mid = o.surfaceAt(center.x);
                     if (o.floorTop) {
                         float surface = std::max(o.surfaceAt(left), o.surfaceAt(right));
                         if (center.y - halfH >= surface) continue;
                         if (o.deadly) return { i, "a hazard slope" };
-                        if (parallel || rise <= 0.05f) {
+                        bool landing = surface + halfH - center.y <= reach;
+                        if (landing && (parallel || rise <= 0.05f)) {
                             center.y = surface + halfH;
                             continue;
                         }
-                        if (center.y - innerH < surface) return { i, "a slope" };
+                        // Into the face: a crash once the inner box is under
+                        // the surface, a corner graze otherwise.
+                        if (centerOver && center.y - innerH < mid) return { i, "a slope" };
                     }
                     else {
                         float surface = std::min(o.surfaceAt(left), o.surfaceAt(right));
                         if (center.y + halfH <= surface) continue;
                         if (o.deadly) return { i, "a hazard slope" };
-                        if (parallel || rise >= -0.05f) {
+                        bool landing = center.y + halfH - surface <= reach;
+                        if (landing && (parallel || rise >= -0.05f)) {
                             center.y = surface - halfH;
                             continue;
                         }
-                        if (center.y + innerH > surface) return { i, "a slope" };
+                        if (centerOver && center.y + innerH > mid) return { i, "a slope" };
                     }
                 }
             }
