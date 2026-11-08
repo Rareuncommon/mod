@@ -8,9 +8,9 @@
 	},
 	"id": "yourname.input-buffer",
 	"name": "Input Buffer",
-	"version": "v1.7.3",
+	"version": "v1.8.0",
 	"developer": "yourname",
-	"description": "Practice tool for click patterns, with wave lookahead. Buffer and Snap only work in practice mode or from a start position.",
+	"description": "Practice tool for click patterns, with a lookahead for wave, ship, UFO and swing. Buffer and Snap only work in practice mode or from a start position.",
 	"settings": {
 		"enabled": {
 			"type": "bool",
@@ -21,7 +21,7 @@
 		"mode": {
 			"type": "string",
 			"name": "Mode",
-			"description": "Buffer: hold early presses until the player can act. On wave, the mod simulates the path ahead and holds a click or release that would crash until the first step where it would not.\nSnap to best run: a click that comes within the snap window before a click from your best run is held and fired at the right moment. Every other click works as normal. Your furthest attempt from each start position is saved as the best run automatically.\nBuffer and Snap only work in practice mode or from a start position.",
+			"description": "Buffer: hold early presses until the player can act. On wave, ship, UFO and swing, the mod simulates the path ahead and holds a click or release that would crash until the best step to fire it. Ship, UFO and swing physics are learned from a few seconds of flying first.\nSnap to best run: a click that comes within the snap window before a click from your best run is held and fired at the right moment. Every other click works as normal. Your furthest attempt from each start position is saved as the best run automatically.\nBuffer and Snap only work in practice mode or from a start position.",
 			"default": "Buffer",
 			"one-of": [
 				"Buffer",
@@ -31,15 +31,15 @@
 		"buffer-frames": {
 			"type": "int",
 			"name": "Buffer Frames",
-			"description": "How many physics steps a press is held while the player cannot act yet, or, on wave, how many steps late a click or release may be fired to avoid a crash. 0 disables buffering.",
+			"description": "How many physics steps a press is held while the player cannot act yet, or, on wave, ship, UFO and swing, how many steps late a click or release may be fired to avoid a crash. 0 disables buffering.",
 			"default": 6,
 			"min": 0,
 			"max": 30
 		},
 		"wave-lookahead": {
 			"type": "int",
-			"name": "Wave Lookahead",
-			"description": "Buffer mode, wave: how many physics steps ahead the mod checks the wave's path after a click or release. Longer sees obstacles sooner but holds more clicks that only crash because you would have released in time. At 240 steps per second, 48 steps is 0.2 seconds.",
+			"name": "Lookahead",
+			"description": "Buffer mode, wave, ship, UFO and swing: how many physics steps ahead the mod checks the path after a click or release. Longer sees obstacles sooner but holds more clicks that only crash because you would have let go in time. At 240 steps per second, 48 steps is 0.2 seconds.",
 			"default": 48,
 			"min": 5,
 			"max": 240
@@ -68,8 +68,8 @@
 		},
 		"show-wave-prediction": {
 			"type": "bool",
-			"name": "Show Wave Prediction",
-			"description": "On each wave click, draw what the mod predicted: your hitbox (white), the path if the click fires now (red if it crashes, green if not), the path at the delay it chose (yellow), the hazards it checked (orange) and the blocks and slope surfaces it checked (cyan). Details are also written to the Geode log.",
+			"name": "Show Prediction",
+			"description": "On each wave, ship, UFO or swing click, draw what the mod predicted: your hitbox (white), the path if the click fires now (red if it crashes, green if not), the path at the delay it chose (yellow), the hazards it checked (orange) and the blocks and slope surfaces it checked (cyan). Details, including the learned physics, are also written to the Geode log.",
 			"default": true
 		},
 		"toggle-key": {
