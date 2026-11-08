@@ -109,7 +109,8 @@
 // whole jump is seen, and holding jumps again on every landing. Clicks on an
 // orb and spider clicks are not simulated.
 //
-// The prediction is the mod's own model, not the game's physics:
+// The prediction is the mod's own model, not the game's physics (src/sim.hpp,
+// tested in tests/):
 //   - x moves by the last step's measured x movement (speed portals, speed
 //     changes and teleports inside the lookahead are not seen).
 //   - Wave: y moves by that x movement times the wave slope. The direction
@@ -125,9 +126,9 @@
 //     object radius, like saws) use the same circle test as the game's
 //     playerIntersectsCircle. Solids (Solid, Breakable) the wave was already
 //     level with in x are slid along (top or bottom); after that, any solid
-//     the inner box (kWaveInnerScale of the hitbox) overlaps kills, which is
+//     the inner box (sim::kInnerScale of the hitbox) overlaps kills, which is
 //     a side or head-on hit.
-//     The level floor (y = kFloorY) is slid along too.
+//     The level floor (y = sim::kFloorY) is slid along too.
 //   - Slopes (Slope) are the line from slopeYPos() at the left and right of
 //     their rect, solid below it (slopeFloorTop()) or above it. The wave
 //     slides along one it moves parallel to, or lands on one that is flat or
@@ -184,6 +185,8 @@
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/ui/GeodeUI.hpp>
 
+#include "sim.hpp"
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -223,10 +226,19 @@ namespace {
         bool matched = false;   // already used to snap a player input
     };
 
-    // Wave lookahead (see the header comment).
-    constexpr float kWaveInnerScale = 0.3f; // inner box used for block hits
-    constexpr float kFloorY = 90.f;          // top of the level's ground
+    // Lookahead (see the header comment). The prediction itself is in
+    // sim.hpp; these are the game-side pieces.
     constexpr float kWaveMargin = 60.f;      // extra area searched for objects
+
+    using FlyMode = sim::Mode;
+    using sim::isFlyingMode;
+    using sim::isGroundMode;
+    using FlightPhysics = sim::Physics;
+    using WaveObstacle = sim::Obstacle;
+
+    sim::Vec toSim(CCPoint p) { return { p.x, p.y }; }
+    sim::Rect toSim(CCRect const& r) { return sim::Rect(r.origin.x, r.origin.y, r.size.width, r.size.height); }
+    CCPoint toCC(sim::Vec v) { return ccp(v.x, v.y); }
 
     struct WaveTrack {
         bool hasPosition = false;
@@ -256,26 +268,7 @@ namespace {
         int step = 0;            // step to fire on
     };
 
-    struct WaveObstacle {
-        CCRect rect;
-        CCPoint center;          // for round hazards
-        float radius = 0.f;      // > 0: round hazard
-        bool hazard = false;     // else solid
-        bool slope = false;      // a slope: solid on one side of a line
-        bool floorTop = false;   // slope: solid below the line (else above)
-        bool deadly = false;     // slope: kills on touch
-        float y0 = 0.f, y1 = 0.f;// slope: line height at rect min x / max x
-
-        float surfaceAt(float x) const {
-            float w = rect.size.width;
-            if (w <= 0.f) return y0;
-            float t = std::clamp((x - rect.getMinX()) / w, 0.f, 1.f);
-            return y0 + (y1 - y0) * t;
-        }
-    };
-
-    // Modes the lookahead simulates.
-    enum class FlyMode { None, Wave, Ship, Ufo, Swing, Cube, Ball, Robot };
+    // The mode the lookahead simulates for a player.
 
     FlyMode flyMode(PlayerObject* player) {
         if (!player || player->m_isDead || player->m_isPlatformer || player->m_isSideways) return FlyMode::None;
@@ -289,68 +282,9 @@ namespace {
         return FlyMode::Cube;
     }
 
-    // Modes where a click acts at once wherever the player is.
-    bool isFlyingMode(FlyMode mode) {
-        return mode == FlyMode::Wave || mode == FlyMode::Ship || mode == FlyMode::Ufo || mode == FlyMode::Swing;
-    }
-
-    // Modes where a click acts at once on the ground (in the air, the
-    // normal buffer waits for landing instead).
-    bool isGroundMode(FlyMode mode) {
-        return mode == FlyMode::Cube || mode == FlyMode::Ball || mode == FlyMode::Robot;
-    }
-
     // A ground-mode jump lasts longer than the lookahead setting usually
     // covers, so they look at least this far ahead to see where it lands.
     constexpr int kGroundLookahead = 120;
-
-    // A running estimate of one number, from measurements. Measurements far
-    // off the estimate (a bump into a block, a portal) are ignored once there
-    // are enough of them to trust the estimate.
-    //
-    // If many measurements in a row disagree with the estimate, the estimate
-    // itself was wrong (its first measurements were bad), so it starts over
-    // from the new ones instead of rejecting them forever.
-    struct Estimate {
-        float value = 0.f;
-        int count = 0;
-        int rejectedInRow = 0;
-        void add(float v) {
-            if (count >= 8 && std::abs(v - value) > std::max(0.5f * std::abs(value), 0.05f)) {
-                if (++rejectedInRow < 6) return;
-                count = 0;
-            }
-            rejectedInRow = 0;
-            value = count == 0 ? v : value + (v - value) * 0.2f;
-            count++;
-        }
-    };
-
-    // Vertical physics of ship, UFO and swing, learned while playing. All
-    // values are in level units per step, in the gravity frame (positive =
-    // away from gravity).
-    struct FlightPhysics {
-        Estimate accelHeld;      // ship: speed change per step while held
-        Estimate accelFree;      // ship released, UFO: gravity (negative);
-                                 // swing: pull toward gravity (negative)
-        Estimate impulse;        // UFO: speed on the step of a click;
-                                 // cube, robot: jump speed; ball: speed
-                                 // after a gravity flip
-        float maxUp = 0.f;       // fastest speed seen away from gravity
-        float maxDown = 0.f;     // fastest speed seen toward gravity
-
-        bool ready(FlyMode mode) const {
-            switch (mode) {
-                case FlyMode::Ship: return accelHeld.count >= 5 && accelFree.count >= 5;
-                case FlyMode::Ufo: return impulse.count >= 2 && accelFree.count >= 10;
-                case FlyMode::Swing: return accelFree.count >= 10;
-                case FlyMode::Cube:
-                case FlyMode::Ball:
-                case FlyMode::Robot: return impulse.count >= 2 && accelFree.count >= 10;
-                default: return true;
-            }
-        }
-    };
 
     // [mode: ship, UFO, swing, cube, ball, robot][mini]. Kept for the whole
     // session, since the physics are the same in every level.
@@ -1282,7 +1216,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
             minY = std::min(minY, pos.y - reachY);
             maxY = std::max(maxY, pos.y + reachY);
         }
-        CCRect area(minX - kWaveMargin, minY - kWaveMargin,
+        sim::Rect area(minX - kWaveMargin, minY - kWaveMargin,
             maxX - minX + 2 * kWaveMargin, maxY - minY + 2 * kWaveMargin);
 
         for (auto object : CCArrayExt<GameObject*>(m_objects)) {
@@ -1297,11 +1231,11 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
             WaveObstacle o;
             o.hazard = hazard;
-            o.rect = object->getObjectRect();
+            o.rect = toSim(object->getObjectRect());
             if (hazard && object->m_objectRadius > 0.f) {
                 o.radius = object->getObjectRadius();
-                o.center = object->getPosition();
-                o.rect = CCRect(o.center.x - o.radius, o.center.y - o.radius, o.radius * 2, o.radius * 2);
+                o.center = toSim(object->getPosition());
+                o.rect = sim::Rect(o.center.x - o.radius, o.center.y - o.radius, o.radius * 2, o.radius * 2);
             }
             if (o.rect.size.width <= 0.f || o.rect.size.height <= 0.f) continue;
             if (!o.rect.intersectsRect(area)) continue;
@@ -1317,224 +1251,50 @@ class $modify(BufferPlayLayer, PlayLayer) {
         return obstacles;
     }
 
-    struct WaveSim {
-        int survived = 0;            // steps survived (== steps: no crash)
-        char const* cause = "";      // what the crash hit
-    };
+    using WaveSim = sim::Result;
+    using WaveChoice = sim::Choice;
 
-    // Which way the wave is moving now: measured from the last step, or,
-    // while sliding (no vertical movement), from the button and gravity.
     bool waveGoingUp(PlayerObject* player, bool held) {
-        auto const& t = this->waveTrack(player);
-        if (t.delta.y > 0.01f) return true;
-        if (t.delta.y < -0.01f) return false;
-        return held != player->m_isUpsideDown;
+        return sim::waveGoingUp(this->simPlayer(player), held);
     }
 
-    // Simulates one player for `steps` steps. The button is `heldBefore`
-    // until step `switchAt`, then the other way; with `switchBackAt` >= 0 it
-    // goes back on that step.
-    //   wave:  moves diagonally, up or down by the button (its current
-    //          direction is the measured one until the first switch).
-    //   ship:  speed changes by the learned held / released acceleration.
-    //   UFO:   a press sets the learned jump speed, then gravity.
-    //   swing: a press flips gravity, then the learned pull.
-    // Speeds are capped at the fastest seen, and a ship, UFO or swing that
-    // slides along a block or slope stops moving vertically.
-    WaveSim simulateWave(
-        PlayerObject* player, std::vector<WaveObstacle> const& obstacles,
-        bool heldBefore, int switchAt, int switchBackAt, int steps,
-        std::vector<CCPoint>* path = nullptr
-    ) {
+    // The prediction's view of a player right now.
+    sim::Player simPlayer(PlayerObject* player) {
         auto const& t = this->waveTrack(player);
-        float dx = t.delta.x;
-        float dy = std::abs(dx) * this->waveSlope(player);
-        auto mode = flyMode(player);
-        auto physics = physicsFor(player);
-        bool startUp = this->waveGoingUp(player, heldBefore);
-        float g = player->m_isUpsideDown ? -1.f : 1.f; // gravity frame
-        float speed = g * t.delta.y;                    // in the gravity frame
-        bool grounded = isGroundMode(mode) && this->onGround(player);
-        if (grounded) speed = 0.f;
-
+        sim::Player p;
+        p.mode = flyMode(player);
         auto pos = player->getPosition();
         auto box = player->getObjectRect();
         CCPoint offset = ccp(box.getMidX() - pos.x, box.getMidY() - pos.y);
         // A stale rect would put the hitbox somewhere else entirely.
         if (std::abs(offset.x) > 15.f || std::abs(offset.y) > 15.f) offset = CCPointZero;
-        float halfW = box.size.width / 2, halfH = box.size.height / 2;
-        float innerW = halfW * kWaveInnerScale, innerH = halfH * kWaveInnerScale;
-        CCPoint center = pos + offset;
-        if (path) path->push_back(center);
-
-        for (int i = 0; i < steps; ++i) {
-            bool up = startUp;
-            if (i >= switchAt) up = !startUp;
-            if (switchBackAt >= 0 && i >= switchBackAt) up = startUp;
-
-            bool held = heldBefore;
-            if (i >= switchAt) held = !heldBefore;
-            if (switchBackAt >= 0 && i >= switchBackAt) held = heldBefore;
-            bool pressed = held && ((i == switchAt) || (switchBackAt >= 0 && i == switchBackAt));
-
-            float moveY;
-            if (mode == FlyMode::Wave || !physics) {
-                moveY = up ? dy : -dy;
-            }
-            else {
-                switch (mode) {
-                    case FlyMode::Ship:
-                        speed += held ? physics->accelHeld.value : physics->accelFree.value;
-                        break;
-                    case FlyMode::Ufo:
-                        if (pressed) speed = physics->impulse.value;
-                        else speed += physics->accelFree.value;
-                        break;
-                    case FlyMode::Swing:
-                        if (pressed) {
-                            g = -g;
-                            speed = -speed;
-                        }
-                        speed += physics->accelFree.value;
-                        break;
-                    case FlyMode::Cube:
-                    case FlyMode::Robot:
-                        // Holding jumps again on every landing.
-                        if (grounded && held) {
-                            speed = physics->impulse.value;
-                            grounded = false;
-                        }
-                        else if (mode == FlyMode::Robot && held && physics->accelHeld.count >= 5) {
-                            speed += physics->accelHeld.value;
-                        }
-                        else speed += physics->accelFree.value;
-                        break;
-                    case FlyMode::Ball:
-                        if (grounded && held) {
-                            g = -g;
-                            speed = physics->impulse.value;
-                            grounded = false;
-                        }
-                        else speed += physics->accelFree.value;
-                        break;
-                    default: break;
-                }
-                if (physics->maxUp > 0.f) speed = std::min(speed, physics->maxUp);
-                if (physics->maxDown > 0.f) speed = std::max(speed, -physics->maxDown);
-                moveY = g * speed;
-                up = moveY > 0.f;
-            }
-
-            float prevX = center.x;
-            center.x += dx;
-            center.y += moveY;
-            float movedY = center.y;
-
-            // Blocks the wave was already level with in x: it moved onto
-            // their top or bottom, so it slides along them.
-            for (auto const& o : obstacles) {
-                if (o.hazard || o.slope) continue;
-                bool wasOver = prevX + halfW > o.rect.getMinX() && prevX - halfW < o.rect.getMaxX();
-                if (!wasOver) continue;
-                CCRect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
-                if (!outer.intersectsRect(o.rect)) continue;
-                if (up) center.y = std::min(center.y, o.rect.getMinY() - halfH);
-                else center.y = std::max(center.y, o.rect.getMaxY() + halfH);
-            }
-            center.y = std::max(center.y, kFloorY + halfH);
-
-            // Blocks it reaches from the side: a crash if the inner box is
-            // level with them, a corner graze otherwise.
-            CCRect inner(center.x - innerW, center.y - innerH, innerW * 2, innerH * 2);
-            for (auto const& o : obstacles) {
-                if (o.hazard || o.slope) continue;
-                if (inner.intersectsRect(o.rect)) return { i, "a block" };
-            }
-
-            // Slopes: the wave slides along one it moves parallel to, or one
-            // it lands on that is flat or falling away in its direction (like
-            // the floor). Running into the rising face crashes once the inner
-            // box is in; touching a hazard slope crashes.
-            {
-                float waveRise = moveY / std::max(std::abs(dx), 0.001f);
-                float dir = dx < 0.f ? -1.f : 1.f;
-                for (auto const& o : obstacles) {
-                    if (!o.slope) continue;
-                    CCRect box(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
-                    if (!box.intersectsRect(o.rect)) continue;
-                    float left = center.x - halfW, right = center.x + halfW;
-                    // Surface rise per unit moved in the wave's direction.
-                    float rise = (o.y1 - o.y0) / o.rect.size.width * dir;
-                    bool parallel = std::abs(waveRise - rise) < 0.2f;
-                    // Only a surface the player reached this step (within one
-                    // step's vertical move) can be landed on; deeper means it
-                    // ran into the slope's face from the side.
-                    float reach = std::abs(moveY) + 1.5f;
-                    bool centerOver = center.x >= o.rect.getMinX() && center.x <= o.rect.getMaxX();
-                    float mid = o.surfaceAt(center.x);
-                    if (o.floorTop) {
-                        float surface = std::max(o.surfaceAt(left), o.surfaceAt(right));
-                        if (center.y - halfH >= surface) continue;
-                        if (o.deadly) return { i, "a hazard slope" };
-                        bool landing = surface + halfH - center.y <= reach;
-                        if (landing && (parallel || rise <= 0.05f)) {
-                            center.y = surface + halfH;
-                            continue;
-                        }
-                        // Into the face: a crash once the inner box is under
-                        // the surface, a corner graze otherwise.
-                        if (centerOver && center.y - innerH < mid) return { i, "a slope" };
-                    }
-                    else {
-                        float surface = std::min(o.surfaceAt(left), o.surfaceAt(right));
-                        if (center.y + halfH <= surface) continue;
-                        if (o.deadly) return { i, "a hazard slope" };
-                        bool landing = center.y + halfH - surface <= reach;
-                        if (landing && (parallel || rise >= -0.05f)) {
-                            center.y = surface - halfH;
-                            continue;
-                        }
-                        if (centerOver && center.y + innerH > mid) return { i, "a slope" };
-                    }
-                }
-            }
-
-            // Pushed out by a block, slope or the floor: stop moving that way.
-            if (mode != FlyMode::Wave && center.y != movedY) {
-                // Pushed back against gravity: landed on something.
-                grounded = g * moveY <= 0.f;
-                speed = 0.f;
-            }
-            else grounded = false;
-            if (path) path->push_back(center);
-
-            CCRect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
-            for (auto const& o : obstacles) {
-                if (!o.hazard) continue;
-                if (o.radius > 0.f) {
-                    if (ccpDistance(o.center, center) <= halfW + o.radius) return { i, "a saw" };
-                }
-                else if (outer.intersectsRect(o.rect)) return { i, "a spike" };
-            }
-        }
-        return { steps, "" };
+        p.center = toSim(pos + offset);
+        p.halfW = box.size.width / 2;
+        p.halfH = box.size.height / 2;
+        p.upsideDown = player->m_isUpsideDown;
+        p.dx = t.delta.x;
+        p.lastDy = t.delta.y;
+        p.waveSlope = this->waveSlope(player);
+        p.grounded = isGroundMode(p.mode) && this->onGround(player);
+        p.physics = physicsFor(player);
+        return p;
     }
 
-    struct WaveChoice {
-        int delay = 0;           // steps to wait before firing
-        int survivedNow = 0;     // steps survived after firing now
-        int survivedBest = 0;    // steps survived after firing at `delay`
-        char const* causeNow = "";
-        int lookahead = 0;       // steps looked at after the input
-    };
+    WaveSim simulateWave(
+        PlayerObject* player, std::vector<WaveObstacle> const& obstacles,
+        bool heldBefore, int switchAt, int switchBackAt, int steps,
+        std::vector<CCPoint>* path = nullptr
+    ) {
+        std::vector<sim::Vec> simPath;
+        auto result = sim::simulate(
+            this->simPlayer(player), obstacles, heldBefore, switchAt, switchBackAt, steps,
+            path ? &simPath : nullptr
+        );
+        if (path) for (auto v : simPath) path->push_back(toCC(v));
+        return result;
+    }
 
-    // Picks when to fire. For each delay it measures how long the players
-    // survive after the input fires. Holding the button forever crashes in
-    // most wave parts, which moves with the delay and is no reason to wait;
-    // a delay is only worth it when it survives clearly longer than firing
-    // now. Delays where waiting itself crashes are skipped.
     WaveChoice chooseWaveDelay(bool isPlayer1, bool push, int maxDelay, int followGap) {
-        constexpr int kMinGain = 3;
         auto players = this->inputPlayers(isPlayer1);
         int lookahead = waveLookahead();
         bool ground = std::any_of(players.begin(), players.end(), [](PlayerObject* player) {
@@ -1542,38 +1302,11 @@ class $modify(BufferPlayLayer, PlayLayer) {
         });
         if (ground) lookahead = std::max(lookahead, kGroundLookahead);
         auto obstacles = this->gatherObstacles(players, lookahead + maxDelay);
-        bool held = !push; // button state until the input fires
+        bool held = !push;
 
-        WaveChoice choice;
-        choice.lookahead = lookahead;
-        int bestDelay = 0, best = -1;
-        for (int delay = 0; delay <= maxDelay; ++delay) {
-            int steps = lookahead + delay;
-            int switchBack = followGap > 0 ? delay + followGap : -1;
-            int survived = steps;
-            char const* cause = "";
-            for (auto player : players) {
-                auto sim = this->simulateWave(player, obstacles, held, delay, switchBack, steps);
-                if (sim.survived < survived) {
-                    survived = sim.survived;
-                    cause = sim.cause;
-                }
-            }
-            if (survived < delay) break; // waiting this long crashes first
-            int after = std::min(survived - delay, lookahead);
-            if (delay == 0) {
-                choice.survivedNow = after;
-                choice.causeNow = cause;
-            }
-            if (after > best) {
-                best = after;
-                bestDelay = delay;
-            }
-            if (after >= lookahead) break; // can't do better
-        }
-        choice.survivedBest = std::max(best, 0);
-        if (choice.survivedNow >= lookahead || best < choice.survivedNow + kMinGain) choice.delay = 0;
-        else choice.delay = bestDelay;
+        std::vector<sim::Player> simPlayers;
+        for (auto player : players) simPlayers.push_back(this->simPlayer(player));
+        auto choice = sim::choose(simPlayers, obstacles, push, maxDelay, followGap, lookahead);
 
         this->logWaveChoice(players, obstacles, held, maxDelay, followGap, choice);
         if (showWavePrediction()) this->drawWaveChoice(players, obstacles, held, followGap, choice);
@@ -1638,10 +1371,10 @@ class $modify(BufferPlayLayer, PlayLayer) {
                 draw->drawSegment(ccp(o.rect.getMinX(), o.y0), ccp(o.rect.getMaxX(), o.y1), 1.25f, color);
             }
             else if (o.radius > 0.f) {
-                draw->drawCircle(o.center, o.radius, none, 1.f, color, 24);
+                draw->drawCircle(toCC(o.center), o.radius, none, 1.f, color, 24);
             }
             else {
-                draw->drawRect(o.rect.origin, ccp(o.rect.getMaxX(), o.rect.getMaxY()), none, 1.f, color);
+                draw->drawRect(ccp(o.rect.getMinX(), o.rect.getMinY()), ccp(o.rect.getMaxX(), o.rect.getMaxY()), none, 1.f, color);
             }
         }
 

@@ -2,3 +2,4 @@ build/
 build-*/
 *.geode
 dist/
+tests/build/
