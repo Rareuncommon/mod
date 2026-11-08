@@ -135,8 +135,8 @@
 //     falls away in its direction (like a floor or ceiling), but only when it
 //     reached the surface this step (within one step's vertical move); deeper
 //     means it ran into the slope's face. Running into a face kills once the
-//     inner box is past the line, and a slope with m_slopeIsHazard kills on
-//     touch.
+//     inner box is past the line. (m_slopeIsHazard is not used: it is set on
+//     ordinary slopes the game's hitbox view shows as solid.)
 //   - Objects are taken where they are now: moving objects, triggers that
 //     toggle groups, orbs and portals inside the lookahead are not
 //     simulated, and neither is a ceiling.
@@ -1242,7 +1242,10 @@ class $modify(BufferPlayLayer, PlayLayer) {
             if (slope) {
                 o.slope = true;
                 o.floorTop = object->slopeFloorTop();
-                o.deadly = object->m_slopeIsHazard;
+                // m_slopeIsHazard is set on ordinary corridor slopes that the
+                // game's own hitbox view shows as solid (blue), so it does not
+                // mean "kills on touch". Slopes are treated as solid.
+                o.deadly = false;
                 o.y0 = static_cast<float>(object->slopeYPos(o.rect.getMinX()));
                 o.y1 = static_cast<float>(object->slopeYPos(o.rect.getMaxX()));
             }
