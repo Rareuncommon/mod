@@ -228,6 +228,7 @@ namespace {
         float slope = 0.f;       // measured |dy| / |dx|, 0 = not measured
         float size = 0.f;        // m_vehicleSize the slope was measured at
         int mode = -1;           // FlyMode during the last step
+        float stepSize = 0.f;    // m_vehicleSize during the last step
         bool upsideDown = false; // gravity during the last step
         bool onGround = false;   // touching ground at the start of the last step
     };
@@ -298,11 +299,20 @@ namespace {
     // A running estimate of one number, from measurements. Measurements far
     // off the estimate (a bump into a block, a portal) are ignored once there
     // are enough of them to trust the estimate.
+    //
+    // If many measurements in a row disagree with the estimate, the estimate
+    // itself was wrong (its first measurements were bad), so it starts over
+    // from the new ones instead of rejecting them forever.
     struct Estimate {
         float value = 0.f;
         int count = 0;
+        int rejectedInRow = 0;
         void add(float v) {
-            if (count >= 8 && std::abs(v - value) > std::max(0.5f * std::abs(value), 0.05f)) return;
+            if (count >= 8 && std::abs(v - value) > std::max(0.5f * std::abs(value), 0.05f)) {
+                if (++rejectedInRow < 6) return;
+                count = 0;
+            }
+            rejectedInRow = 0;
             value = count == 0 ? v : value + (v - value) * 0.2f;
             count++;
         }
@@ -350,6 +360,40 @@ namespace {
             default: return nullptr;
         }
         return &g_physics[index][player->m_vehicleSize < 1.f ? 1 : 0];
+    }
+
+    // The learned physics are saved, so each mode is only learned once.
+    // Format: "physics1" then, per mode and size, value and count of
+    // accelHeld, accelFree and impulse, then maxUp and maxDown.
+    void savePhysics() {
+        std::ostringstream out;
+        out << "physics1";
+        for (auto& mode : g_physics) {
+            for (auto& p : mode) {
+                for (auto* e : { &p.accelHeld, &p.accelFree, &p.impulse }) out << ' ' << e->value << ' ' << e->count;
+                out << ' ' << p.maxUp << ' ' << p.maxDown;
+            }
+        }
+        Mod::get()->setSavedValue<std::string>("physics", out.str());
+    }
+
+    void loadPhysics() {
+        auto text = Mod::get()->getSavedValue<std::string>("physics", "");
+        std::istringstream in(text);
+        std::string tag;
+        if (!(in >> tag) || tag != "physics1") return;
+        FlightPhysics loaded[6][2];
+        for (auto& mode : loaded) {
+            for (auto& p : mode) {
+                for (auto* e : { &p.accelHeld, &p.accelFree, &p.impulse }) {
+                    if (!(in >> e->value >> e->count)) return;
+                    // Keep adapting: a saved estimate counts as a few measurements.
+                    e->count = std::min(e->count, 20);
+                }
+                if (!(in >> p.maxUp >> p.maxDown)) return;
+            }
+        }
+        std::copy(&loaded[0][0], &loaded[0][0] + 12, &g_physics[0][0]);
     }
 
     struct SnapHold {
@@ -806,6 +850,11 @@ class $modify(BufferPlayLayer, PlayLayer) {
         m_fields->checkpointSteps.clear();
     }
 
+    void onQuit() {
+        savePhysics();
+        PlayLayer::onQuit();
+    }
+
     void levelComplete() {
         this->considerSaving(true);
         PlayLayer::levelComplete();
@@ -1048,6 +1097,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
             t.last = pos;
             t.hasPosition = true;
             t.mode = static_cast<int>(flyMode(player));
+            t.stepSize = player->m_vehicleSize;
             t.upsideDown = player->m_isUpsideDown;
             t.onGround = player->m_isOnGround
                 && (player->m_isOnSlope || player->m_wasOnSlope || !t.hasDelta || std::abs(t.delta.y) < 0.01f);
@@ -1059,7 +1109,9 @@ class $modify(BufferPlayLayer, PlayLayer) {
         auto physics = physicsFor(player);
         if (!physics || !t.hasDelta) return;
         auto mode = flyMode(player);
-        if (t.mode != static_cast<int>(mode)) return;
+        // Not the step of a mode or size portal: its movement is no
+        // measurement of either mode's physics.
+        if (t.mode != static_cast<int>(mode) || t.stepSize != player->m_vehicleSize) return;
         if (std::abs(delta.x) < 0.01f || std::abs(delta.y) > 40.f || std::abs(t.delta.y) > 40.f) return;
 
         float g = player->m_isUpsideDown ? -1.f : 1.f;
@@ -1594,7 +1646,15 @@ class $modify(BufferPlayLayer, PlayLayer) {
             return false;
         }
         if (!this->physicsReady(isPlayer1)) {
-            this->report(fmt::format("{}: still learning its physics (fly a few seconds), {} passed through", mode, what));
+            auto players = this->inputPlayers(isPlayer1);
+            bool ground = std::any_of(players.begin(), players.end(), [](PlayerObject* player) {
+                return isGroundMode(flyMode(player));
+            });
+            bool mini = !players.empty() && players.front()->m_vehicleSize < 1.f;
+            this->report(fmt::format(
+                "{}{}: still learning its physics ({}), {} passed through",
+                mini ? "mini " : "", mode, ground ? "jump a few times" : "fly a few seconds", what
+            ));
             return false;
         }
 
@@ -1907,6 +1967,7 @@ namespace {
 }
 
 $on_mod(Loaded) {
+    loadPhysics();
     listenForKeybindSettingPresses("toggle-key", [](Keybind const&, bool down, bool repeat, double) {
         if (!down || repeat) return false;
         auto pl = hotkeyLayer();
