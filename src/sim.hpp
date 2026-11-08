@@ -68,6 +68,7 @@ struct Estimate {
     int count = 0;
     int rejectedInRow = 0;
     void add(float v) {
+        if (!std::isfinite(v)) return; // would poison the estimate for good
         if (count >= 8 && std::abs(v - value) > std::max(0.5f * std::abs(value), 0.05f)) {
             if (++rejectedInRow < 6) return;
             count = 0;
@@ -181,6 +182,23 @@ inline Result simulate(
     Vec center = p.center;
     if (path) path->push_back(center);
 
+    // Only obstacles level with the path in x can be touched (x moves by dx
+    // every step): with many, drop the rest first, keeping their order.
+    std::vector<Obstacle> nearby;
+    bool filtered = false;
+    if (obstacles.size() > 32 && steps > 0) {
+        float x1 = center.x + dx * steps;
+        float lo = std::min(center.x, x1) - halfW - 1.f, hi = std::max(center.x, x1) + halfW + 1.f;
+        if (std::isfinite(lo) && std::isfinite(hi)) {
+            filtered = true;
+            nearby.reserve(obstacles.size());
+            for (auto const& o : obstacles) {
+                if (o.rect.getMaxX() >= lo && o.rect.getMinX() <= hi) nearby.push_back(o);
+            }
+        }
+    }
+    auto const& level = filtered ? nearby : obstacles;
+
     for (int i = 0; i < steps; ++i) {
         bool up = startUp;
         if (i >= switchAt) up = !startUp;
@@ -238,23 +256,28 @@ inline Result simulate(
             up = moveY > 0.f;
         }
 
-        float prevX = center.x, prevY = center.y;
+        float prevY = center.y;
         center.x += dx;
         center.y += moveY;
         float movedY = center.y;
 
         // Blocks the player came onto from above or below: last step it was
-        // level with them in x and clear of them in y, so this step it
-        // reached their top or bottom and slides along it. One it was already
-        // beside (overlapping in y) is a side hit, handled below.
-        for (auto const& o : obstacles) {
+        // clear of them in y, so this step it reached their top or bottom
+        // (also at a corner it only reached in x this step; the push is at
+        // most this step's vertical move) and slides along it. One it was
+        // already beside (overlapping in y) is a side hit, handled below.
+        // Cube and robot only land on the side gravity pulls them to; a
+        // head-hit is left to the inner-box test (deep enough, it kills).
+        for (auto const& o : level) {
             if (o.hazard || o.slope) continue;
-            bool wasOver = prevX + halfW > o.rect.getMinX() && prevX - halfW < o.rect.getMaxX();
-            if (!wasOver) continue;
             Rect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
             if (!outer.intersectsRect(o.rect)) continue;
             bool wasBelow = prevY + halfH <= o.rect.getMinY() + 0.01f;
             bool wasAbove = prevY - halfH >= o.rect.getMaxY() - 0.01f;
+            if (mode == Mode::Cube || mode == Mode::Robot) {
+                if (g > 0.f) wasBelow = false;
+                else wasAbove = false;
+            }
             if (wasBelow) center.y = std::min(center.y, o.rect.getMinY() - halfH);
             else if (wasAbove) center.y = std::max(center.y, o.rect.getMaxY() + halfH);
         }
@@ -263,7 +286,7 @@ inline Result simulate(
         // Blocks it reaches from the side: a crash if the inner box is level
         // with them, a corner graze otherwise.
         Rect inner(center.x - innerW, center.y - innerH, innerW * 2, innerH * 2);
-        for (auto const& o : obstacles) {
+        for (auto const& o : level) {
             if (o.hazard || o.slope) continue;
             if (inner.intersectsRect(o.rect)) return { i, "a block" };
         }
@@ -275,7 +298,7 @@ inline Result simulate(
         {
             float waveRise = moveY / std::max(std::abs(dx), 0.001f);
             float dir = dx < 0.f ? -1.f : 1.f;
-            for (auto const& o : obstacles) {
+            for (auto const& o : level) {
                 if (!o.slope) continue;
                 Rect box(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
                 if (!box.intersectsRect(o.rect)) continue;
@@ -287,6 +310,13 @@ inline Result simulate(
                 // step's vertical move) can be landed on; deeper means it ran
                 // into the slope's face from the side.
                 float reach = std::abs(moveY) + 1.5f;
+                // Non-wave players are pushed up a floor rising (or down a
+                // ceiling coming down) in their direction: the surface also
+                // moves toward them by its rise over one step. Cube, ball
+                // and robot only on the side gravity pulls them to.
+                bool gravitySide = o.floorTop ? g > 0.f : g < 0.f;
+                bool climbs = mode != Mode::Wave && (!isGroundMode(mode) || gravitySide);
+                if (climbs) reach += std::abs(rise * dx);
                 bool centerOver = center.x >= o.rect.getMinX() && center.x <= o.rect.getMaxX();
                 float mid = o.surfaceAt(center.x);
                 if (o.floorTop) {
@@ -294,7 +324,7 @@ inline Result simulate(
                     if (center.y - halfH >= surface) continue;
                     if (o.deadly) return { i, "a hazard slope" };
                     bool landing = surface + halfH - center.y <= reach;
-                    if (landing && (parallel || rise <= 0.05f)) {
+                    if (landing && (parallel || rise <= 0.05f || climbs)) {
                         center.y = surface + halfH;
                         continue;
                     }
@@ -305,7 +335,7 @@ inline Result simulate(
                     if (center.y + halfH <= surface) continue;
                     if (o.deadly) return { i, "a hazard slope" };
                     bool landing = center.y + halfH - surface <= reach;
-                    if (landing && (parallel || rise >= -0.05f)) {
+                    if (landing && (parallel || rise >= -0.05f || climbs)) {
                         center.y = surface - halfH;
                         continue;
                     }
@@ -324,7 +354,7 @@ inline Result simulate(
         if (path) path->push_back(center);
 
         Rect outer(center.x - halfW, center.y - halfH, halfW * 2, halfH * 2);
-        for (auto const& o : obstacles) {
+        for (auto const& o : level) {
             if (!o.hazard) continue;
             if (o.radius > 0.f) {
                 if (distance(o.center, center) <= halfW + o.radius) return { i, "a saw" };
@@ -352,10 +382,13 @@ constexpr int kMinGain = 3;
 // which moves with the delay and is no reason to wait; a delay is only worth
 // it when it survives clearly longer than firing now. Delays where waiting
 // itself crashes are skipped. With `followGap` > 0 the opposite input
-// follows that many steps after the input (a tap).
+// follows that many steps after the input (a tap). `minGain` is how much
+// longer a delay must survive: kMinGain to start holding an input, 1 to keep
+// holding one already held (else each step's new "now" is compared with
+// kMinGain again and the input fires up to kMinGain - 1 steps early).
 inline Choice choose(
     std::vector<Player> const& players, std::vector<Obstacle> const& obstacles,
-    bool push, int maxDelay, int followGap, int lookahead
+    bool push, int maxDelay, int followGap, int lookahead, int minGain = kMinGain
 ) {
     bool held = !push; // button state until the input fires
     Choice choice;
@@ -386,7 +419,7 @@ inline Choice choose(
         if (after >= lookahead) break; // can't do better
     }
     choice.survivedBest = std::max(best, 0);
-    if (choice.survivedNow >= lookahead || best < choice.survivedNow + kMinGain) choice.delay = 0;
+    if (choice.survivedNow >= lookahead || best < choice.survivedNow + minGain) choice.delay = 0;
     else choice.delay = bestDelay;
     return choice;
 }

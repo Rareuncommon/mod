@@ -523,6 +523,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         SnapHold holds[2][kButtonCount];   // indexed like slots
 
         bool inStep = false;     // inside GJBaseGameLayer::processCommands
+        bool lastTick = true;    // this step is the last before the frame is drawn
 
         // Wave lookahead, indexed like slots (by input channel / player).
         WaveTrack waveTracks[2];   // [0] = m_player2, [1] = m_player1
@@ -695,6 +696,10 @@ class $modify(BufferPlayLayer, PlayLayer) {
         m_fields->inStep = inStep;
     }
 
+    void setLastTick(bool lastTick) {
+        m_fields->lastTick = lastTick;
+    }
+
     // Called once per physics step, before the game processes queued input.
     void onStep() {
         auto fields = m_fields.self();
@@ -720,6 +725,9 @@ class $modify(BufferPlayLayer, PlayLayer) {
         auto fields = m_fields.self();
         auto draw = fields->liveDraw;
         if (!draw) return;
+        // Only the last step before a frame is drawn is ever seen (every
+        // 4th step as well, in case the game doesn't flag the last one).
+        if (!fields->lastTick && fields->step % 4 != 0) return;
         draw->clear();
         if (!showLivePrediction() || !modEnabled() || currentMode() != Mode::Buffer || !this->assistAllowed()) return;
         if (!m_started || m_hasCompletedLevel) return;
@@ -1297,7 +1305,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
         return result;
     }
 
-    WaveChoice chooseWaveDelay(bool isPlayer1, bool push, int maxDelay, int followGap) {
+    WaveChoice chooseWaveDelay(bool isPlayer1, bool push, int maxDelay, int followGap, int minGain = sim::kMinGain) {
         auto players = this->inputPlayers(isPlayer1);
         int lookahead = waveLookahead();
         bool ground = std::any_of(players.begin(), players.end(), [](PlayerObject* player) {
@@ -1309,7 +1317,7 @@ class $modify(BufferPlayLayer, PlayLayer) {
 
         std::vector<sim::Player> simPlayers;
         for (auto player : players) simPlayers.push_back(this->simPlayer(player));
-        auto choice = sim::choose(simPlayers, obstacles, push, maxDelay, followGap, lookahead);
+        auto choice = sim::choose(simPlayers, obstacles, push, maxDelay, followGap, lookahead, minGain);
 
         this->logWaveChoice(players, obstacles, held, maxDelay, followGap, choice);
         if (showWavePrediction()) this->drawWaveChoice(players, obstacles, held, followGap, choice);
@@ -1543,9 +1551,15 @@ class $modify(BufferPlayLayer, PlayLayer) {
                 this->report(fmt::format("{}: mode changed or mod off, {} fired {} steps late", mode, what, waited));
                 continue;
             }
-            int remaining = std::max(0, bufferFrames() - waited);
+            // Steps the game has moved the players since the decision: an
+            // input that arrived between steps was decided on the state this
+            // step starts from, so nothing has moved yet.
+            int elapsed = fields->step - w.arrivedStep;
+            if (elapsed <= 0) continue;
+            int remaining = std::max(0, bufferFrames() - elapsed);
             int followGap = w.hasFollow ? w.followGap : 0;
-            auto choice = this->chooseWaveDelay(isPlayer1, w.push, remaining, followGap);
+            // Already held: keep holding for any longer survival.
+            auto choice = this->chooseWaveDelay(isPlayer1, w.push, remaining, followGap, 1);
             if (choice.delay == 0) {
                 this->fireWave(isPlayer1);
                 this->report(choice.survivedNow >= choice.lookahead
@@ -1745,6 +1759,7 @@ class $modify(BufferGameLayer, GJBaseGameLayer) {
         if (pl) {
             // Inputs fired from onStep are processed on this step.
             pl->setInStep(true);
+            pl->setLastTick(isLastTick);
             pl->onStep();
         }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
